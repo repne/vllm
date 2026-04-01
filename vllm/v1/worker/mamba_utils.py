@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
-import itertools
 from collections.abc import Callable
 from typing import Any
 
@@ -148,7 +147,6 @@ def preprocess_mamba(
     scheduler_output: SchedulerOutput,
     kv_cache_config: KVCacheConfig,
     cache_config: CacheConfig,
-    mamba_state_idx: dict[str, int],
     input_batch: GPUInputBatch,
     requests: dict[str, CachedRequestState],
     forward_context: dict[str, Any],
@@ -158,29 +156,37 @@ def preprocess_mamba(
     """
     Copy the mamba state of previous step to the last
     (1 + num_speculative_blocks) block.
+
+    Uses input_batch.mamba_state_idx_cpu[req_index] to track which block
+    contains the running mamba state for each request. -1 means "no previous
+    state" (new/resumed request, compute from num_computed_tokens).
     """
+    assert input_batch.mamba_state_idx_cpu is not None, (
+        "mamba_state_idx_cpu is None - preprocess_mamba should only be called "
+        "for hybrid models (is_hybrid=True)"
+    )
     mamba_group_ids = copy_bufs.mamba_group_ids
     mamba_spec = copy_bufs.mamba_spec
     num_speculative_blocks = mamba_spec.num_speculative_blocks
     # TODO(Chen): we need to optimize this function a lot
     assert cache_config.enable_prefix_caching
     block_size = mamba_spec.block_size
-    finished_req_ids = scheduler_output.finished_req_ids
-    preempted_req_ids = scheduler_output.preempted_req_ids or set()
-    # We need to clear mamba_state_idx for resumed requests. When requests are
-    # force-preempted (e.g., during reset_prefix_cache / KV cache flush),
-    # they appear in resumed_req_ids without a corresponding entry in
-    # preempted_req_ids, leaving stale mamba_state_idx entries that can
-    # point to block indices beyond the new (smaller) block allocation.
+
+    # Clear mamba_state_idx for finished/preempted/resumed requests.
+    # Note: This is now handled in input_batch.remove_request() which sets
+    # mamba_state_idx_cpu[req_index] = -1. For resumed requests that weren't
+    # removed, we reset them here.
     resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
-    for req_id in itertools.chain(finished_req_ids, preempted_req_ids, resumed_req_ids):
-        mamba_state_idx.pop(req_id, None)
+    for req_id in resumed_req_ids:
+        req_index = input_batch.req_id_to_index.get(req_id)
+        if req_index is not None:
+            input_batch.mamba_state_idx_cpu[req_index] = -1
 
     copy_bufs.offset = 0
     for i, req_id in enumerate(input_batch.req_ids):
         req_state = requests[req_id]
-        prev_state_idx = mamba_state_idx.get(req_id)
-        if prev_state_idx is None:
+        prev_state_idx = input_batch.mamba_state_idx_cpu[i]
+        if prev_state_idx == -1:
             # new / resumed request, no previous state
             # if num_computed_tokens is 0, prev_state_idx will be -1
             prev_state_idx = (req_state.num_computed_tokens - 1) // block_size
@@ -202,7 +208,7 @@ def preprocess_mamba(
         # Block 3: speculative block
         # And use block 1 to save the running state.
         curr_state_idx = num_blocks - 1 - num_speculative_blocks
-        mamba_state_idx[req_id] = curr_state_idx
+        input_batch.mamba_state_idx_cpu[i] = curr_state_idx
         if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
             collect_mamba_copy_meta(
                 copy_bufs,
@@ -224,7 +230,6 @@ def postprocess_mamba(
     kv_cache_config: KVCacheConfig,
     input_batch: GPUInputBatch,
     requests: dict[str, CachedRequestState],
-    mamba_state_idx: dict[str, int],
     forward_context: dict[str, Any],
     mamba_state_copy_funcs: tuple[MambaStateCopyFunc, ...],
     copy_bufs: MambaCopyBuffers,
@@ -232,10 +237,17 @@ def postprocess_mamba(
     """
     If a blocks is converted from partial block to full block in this step, copy the
     state from the block for running state to the new full block.
+
+    Uses input_batch.mamba_state_idx_cpu[req_index] to get the source block index.
     """
+    assert input_batch.mamba_state_idx_cpu is not None, (
+        "mamba_state_idx_cpu is None - postprocess_mamba should only be called "
+        "for hybrid models (is_hybrid=True)"
+    )
     num_scheduled_tokens_dict = scheduler_output.num_scheduled_tokens
     scheduled_spec_decode_tokens_dict = scheduler_output.scheduled_spec_decode_tokens
     num_accepted_tokens_cpu = input_batch.num_accepted_tokens_cpu
+    mamba_state_idx_cpu = input_batch.mamba_state_idx_cpu
     mamba_group_ids = copy_bufs.mamba_group_ids
     mamba_spec = copy_bufs.mamba_spec
     copy_bufs.offset = 0
@@ -255,7 +267,7 @@ def postprocess_mamba(
         # TODO: how to ensure all blocks that cache_blocks called are cached here?
         if aligned_new_computed_tokens >= num_tokens_running_state:
             accept_token_bias = aligned_new_computed_tokens - num_tokens_running_state
-            src_block_idx = mamba_state_idx[req_id]
+            src_block_idx = mamba_state_idx_cpu[i]
             dest_block_idx = aligned_new_computed_tokens // mamba_spec.block_size - 1
             collect_mamba_copy_meta(
                 copy_bufs,

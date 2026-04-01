@@ -642,6 +642,7 @@ class GPUModelRunner(
             logitsprocs_need_output_token_ids=bool(custom_logitsprocs)
             or self.vllm_config.reasoning_config is not None,
             is_pooling_model=self.is_pooling_model,
+            is_hybrid=self.model_config.is_hybrid,
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
         )
 
@@ -852,7 +853,8 @@ class GPUModelRunner(
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
-        self.mamba_state_idx: dict[str, int] = {}
+        # Note: mamba_state_idx is now stored in input_batch.mamba_state_idx_cpu
+        # as a tensor indexed by req_index, not a dict keyed by req_id.
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
         self.layerwise_nvtx_hooks_registered = False
 
@@ -1444,7 +1446,6 @@ class GPUModelRunner(
                 self.kv_cache_config,
                 self.input_batch,
                 self.requests,
-                self.mamba_state_idx,
                 self.compilation_config.static_forward_context,
                 self.model.get_mamba_state_copy_func(),
                 self._get_mamba_copy_bufs(),
@@ -3937,7 +3938,6 @@ class GPUModelRunner(
                     scheduler_output,
                     self.kv_cache_config,
                     self.cache_config,
-                    self.mamba_state_idx,
                     self.input_batch,
                     self.requests,
                     self.compilation_config.static_forward_context,
@@ -6474,6 +6474,7 @@ class GPUModelRunner(
                 logitsprocs=self.input_batch.logitsprocs,
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,
+                is_hybrid=self.model_config.is_hybrid,
             )
 
         assert self._init_block_sizes == block_sizes, (

@@ -94,10 +94,12 @@ class InputBatch:
         logitsprocs_need_output_token_ids: bool = False,
         is_spec_decode: bool = False,
         is_pooling_model: bool = False,
+        is_hybrid: bool = False,
         cp_kv_cache_interleave_size: int = 1,
     ):
         self.is_pooling_model = is_pooling_model
         self.is_spec_decode = is_spec_decode
+        self.is_hybrid = is_hybrid
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
         self.max_num_batched_tokens = max_num_batched_tokens
@@ -222,6 +224,25 @@ class InputBatch:
             (max_num_reqs,), dtype=torch.int32, device="cpu", pin_memory=pin_memory
         )
         self.num_accepted_tokens_cpu = self.num_accepted_tokens_cpu_tensor.numpy()
+
+        # Mamba state index for hybrid models (tracks which block contains the
+        # running mamba state for each request). -1 means "no previous state"
+        # (new/resumed request, compute from num_computed_tokens).
+        # Only allocated for hybrid models.
+        if is_hybrid:
+            self.mamba_state_idx_cpu_tensor: torch.Tensor | None = torch.full(
+                (max_num_reqs,),
+                fill_value=-1,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=pin_memory,
+            )
+            self.mamba_state_idx_cpu: np.ndarray | None = (
+                self.mamba_state_idx_cpu_tensor.numpy()
+            )
+        else:
+            self.mamba_state_idx_cpu_tensor = None
+            self.mamba_state_idx_cpu = None
 
         # lora related
         self.request_lora_mapping = np.zeros((self.max_num_reqs,), dtype=np.int64)
@@ -445,6 +466,10 @@ class InputBatch:
         # Speculative decoding: by default 1 token is generated.
         self.num_accepted_tokens_cpu[req_index] = 1
 
+        # Mamba state: -1 means compute from num_computed_tokens (new request)
+        if self.mamba_state_idx_cpu is not None:
+            self.mamba_state_idx_cpu[req_index] = -1
+
         # Add request lora ID
         if request.lora_request:
             lora_id = request.lora_request.lora_int_id
@@ -505,6 +530,10 @@ class InputBatch:
         self.req_output_token_ids[req_index] = None
         self.spec_token_ids[req_index].clear()
         self.block_table.clear_row(req_index)
+
+        # Reset mamba state index
+        if self.mamba_state_idx_cpu is not None:
+            self.mamba_state_idx_cpu[req_index] = -1
 
         # LoRA
         lora_id = self.request_lora_mapping[req_index]
@@ -641,6 +670,11 @@ class InputBatch:
             self.num_accepted_tokens_cpu[i2],
             self.num_accepted_tokens_cpu[i1],
         )
+        if self.mamba_state_idx_cpu is not None:
+            self.mamba_state_idx_cpu[i1], self.mamba_state_idx_cpu[i2] = (
+                self.mamba_state_idx_cpu[i2],
+                self.mamba_state_idx_cpu[i1],
+            )
 
         swap_dict_values(self.generators, i1, i2)
         swap_dict_values(self.bad_words_token_ids, i1, i2)
@@ -765,6 +799,11 @@ class InputBatch:
             self.num_accepted_tokens_cpu[empty_index] = self.num_accepted_tokens_cpu[
                 last_req_index
             ]
+            if self.mamba_state_idx_cpu is not None:
+                self.mamba_state_idx_cpu[empty_index] = self.mamba_state_idx_cpu[
+                    last_req_index
+                ]
+                self.mamba_state_idx_cpu[last_req_index] = -1  # Reset old slot
             generator = self.generators.pop(last_req_index, None)
             if generator is not None:
                 self.generators[empty_index] = generator
