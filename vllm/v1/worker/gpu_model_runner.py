@@ -731,6 +731,19 @@ class GPUModelRunner(
         self.mamba_state_idx.np.fill(-1)
         self.mamba_state_idx.gpu.fill_(-1)
 
+        # Additional per-request metadata for GPU-side postprocess_mamba.
+        # These enable a future GPU kernel to compute mamba state copy decisions
+        # without CPU-GPU synchronization.
+        self.num_scheduled_tokens_buf = self._make_buffer(
+            self.max_num_reqs, dtype=torch.int32
+        )
+        self.num_computed_tokens_buf = self._make_buffer(
+            self.max_num_reqs, dtype=torch.int32
+        )
+        self.num_draft_tokens_buf = self._make_buffer(
+            self.max_num_reqs, dtype=torch.int32
+        )
+
         # Only relevant for multimodal models
         if self.supports_mm_inputs:
             # Double buffer to avoid race condition: previous iteration's async
@@ -3976,6 +3989,23 @@ class GPUModelRunner(
                     self.input_batch.mamba_state_idx_cpu[:num_reqs]
                 )
                 self.mamba_state_idx.copy_to_gpu(num_reqs)
+
+                # Sync additional per-request metadata for GPU postprocess_mamba.
+                # These values don't change between _prepare_inputs and
+                # _update_states_after_model_execute, so syncing here is safe.
+                scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+                for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                    req_state = self.requests[req_id]
+                    self.num_scheduled_tokens_buf.np[i] = (
+                        scheduler_output.num_scheduled_tokens[req_id]
+                    )
+                    self.num_computed_tokens_buf.np[i] = req_state.num_computed_tokens
+                    self.num_draft_tokens_buf.np[i] = len(
+                        scheduled_spec_tokens.get(req_id, [])
+                    )
+                self.num_scheduled_tokens_buf.copy_to_gpu(num_reqs)
+                self.num_computed_tokens_buf.copy_to_gpu(num_reqs)
+                self.num_draft_tokens_buf.copy_to_gpu(num_reqs)
 
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
