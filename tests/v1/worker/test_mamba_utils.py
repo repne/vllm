@@ -616,3 +616,163 @@ class TestPostprocessMambaFusedKernel:
         torch.testing.assert_close(
             temporal_state_gpu, temporal_state_py, msg="Temporal state mismatch"
         )
+
+    def test_block_table_with_realistic_stride(self, device, test_config):
+        """
+        Test kernel with realistic block table strides.
+
+        In real usage, the block table is pre-allocated with shape
+        [max_num_reqs, max_num_blocks_per_req] and then sliced to
+        [:num_reqs]. This means stride(0) = max_num_blocks_per_req,
+        which is typically much larger than the actual blocks used.
+
+        This test verifies the kernel handles non-tight strides correctly,
+        catching bugs where stride is incorrectly treated as bytes vs elements.
+        """
+        cfg = test_config
+        torch.manual_seed(789)
+
+        # Use multiple requests to exercise stride-based indexing
+        num_reqs = 4
+        req_ids = [f"req_{i}" for i in range(num_reqs)]
+
+        # All requests trigger copies (same setup as test_various_batch_sizes)
+        num_computed_tokens = [60] * num_reqs
+        num_scheduled_tokens = {r: 5 for r in req_ids}
+        num_draft_tokens: dict[str, int] = {}
+        num_accepted_tokens = [3] * num_reqs
+        mamba_state_idx = [3] * num_reqs
+
+        # Each request uses only 8 blocks, but we allocate much more
+        blocks_used_per_req = 8
+        block_ids_per_req = [
+            list(range(i * blocks_used_per_req, (i + 1) * blocks_used_per_req))
+            for i in range(num_reqs)
+        ]
+
+        total_blocks = num_reqs * blocks_used_per_req
+        cfg = _TestConfig(num_blocks=total_blocks, max_num_reqs=max(16, num_reqs))
+
+        layer_names = ["layer_0"]
+        kv_cache_config = _make_kv_cache_config(cfg, layer_names)
+        copy_funcs = (get_conv_copy_spec, get_temporal_copy_spec)
+
+        # Create states for Python path
+        conv_state_py = torch.randn(
+            total_blocks,
+            cfg.conv_width,
+            cfg.conv_inner_dim,
+            dtype=cfg.dtype,
+            device=device,
+        )
+        temporal_state_py = torch.randn(
+            total_blocks, cfg.temporal_state_dim, dtype=cfg.dtype, device=device
+        )
+
+        # Clone for GPU path
+        conv_state_gpu = conv_state_py.clone()
+        temporal_state_gpu = temporal_state_py.clone()
+
+        forward_context_py = {
+            "layer_0": _make_mock_attention(conv_state_py, temporal_state_py)
+        }
+        forward_context_gpu = {
+            "layer_0": _make_mock_attention(conv_state_gpu, temporal_state_gpu)
+        }
+
+        # Run Python path
+        scheduler_output = _make_postprocess_scheduler_output(
+            req_ids,
+            num_scheduled_tokens,
+            {k: [None] * v for k, v in num_draft_tokens.items() if v > 0},
+        )
+        input_batch_py = _make_input_batch(
+            req_ids, num_accepted_tokens.copy(), mamba_state_idx.copy()
+        )
+        requests = _make_requests(req_ids, num_computed_tokens, block_ids_per_req)
+        copy_bufs = _make_copy_bufs(cfg, kv_cache_config, device)
+
+        postprocess_mamba(
+            scheduler_output,
+            kv_cache_config,
+            input_batch_py,
+            requests,
+            forward_context_py,
+            copy_funcs,
+            copy_bufs,
+        )
+        torch.accelerator.synchronize()
+
+        # Run GPU path with REALISTIC block table stride
+        gpu_ctx = MambaGPUContext.create(
+            max_num_reqs=cfg.max_num_reqs,
+            kv_cache_config=kv_cache_config,
+            num_state_types=2,
+            device=device,
+        )
+        gpu_ctx.initialize_from_forward_context(
+            kv_cache_config, forward_context_gpu, copy_funcs
+        )
+
+        # KEY DIFFERENCE: Create a large block table like real code does
+        # Real system has max_num_blocks_per_req >> blocks actually used
+        max_num_reqs_full = 16
+        max_blocks_per_req_full = 512  # Much larger than blocks_used_per_req=8
+
+        # Allocate full-size table (simulates pre-allocated CpuGpuBuffer)
+        block_table_full = torch.zeros(
+            max_num_reqs_full, max_blocks_per_req_full, dtype=torch.int32, device=device
+        )
+
+        # Fill in actual block IDs (only first few columns used)
+        for i, block_ids in enumerate(block_ids_per_req):
+            block_table_full[i, : len(block_ids)] = torch.tensor(
+                block_ids, dtype=torch.int32
+            )
+
+        # Slice like real code: block_table.gpu[:num_reqs]
+        # This preserves stride(0) = 512, not 8!
+        block_table_gpu = block_table_full[:num_reqs]
+
+        # Verify stride is large (the key property we're testing)
+        assert block_table_gpu.stride(0) == max_blocks_per_req_full, (
+            f"Expected stride {max_blocks_per_req_full}, "
+            f"got {block_table_gpu.stride(0)}"
+        )
+
+        gpu_ctx.run_fused_postprocess(
+            num_reqs=num_reqs,
+            num_accepted_tokens_gpu=torch.tensor(
+                num_accepted_tokens, dtype=torch.int32, device=device
+            ),
+            mamba_state_idx_gpu=torch.tensor(
+                mamba_state_idx, dtype=torch.int32, device=device
+            ),
+            num_scheduled_tokens_gpu=torch.tensor(
+                [num_scheduled_tokens[r] for r in req_ids],
+                dtype=torch.int32,
+                device=device,
+            ),
+            num_computed_tokens_gpu=torch.tensor(
+                num_computed_tokens, dtype=torch.int32, device=device
+            ),
+            num_draft_tokens_gpu=torch.tensor(
+                [num_draft_tokens.get(r, 0) for r in req_ids],
+                dtype=torch.int32,
+                device=device,
+            ),
+            block_table_gpu=block_table_gpu,
+        )
+        torch.accelerator.synchronize()
+
+        # Compare results - this will fail if stride handling is incorrect
+        torch.testing.assert_close(
+            conv_state_gpu,
+            conv_state_py,
+            msg="Conv state mismatch - possible stride bug in kernel",
+        )
+        torch.testing.assert_close(
+            temporal_state_gpu,
+            temporal_state_py,
+            msg="Temporal state mismatch - possible stride bug in kernel",
+        )
