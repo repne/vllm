@@ -381,7 +381,6 @@ class AllGatherCutlassScaledMMPattern(BasePattern):
         )
 
 
-FLASHINFER_BMM_FP8_DTYPE = torch.float8_e4m3fn
 VIEW_LIKE_OPS = (
     torch.ops.aten.view.default,
     torch.ops.aten.reshape.default,
@@ -676,60 +675,8 @@ def _classify_qkv_branch(node: fx.Node) -> str | None:
     return None
 
 
-class _FlashInferCollectivePatternBase(BasePattern):
-    def empty_fp8(self, *shape: int) -> torch.Tensor:
-        return torch.empty(*shape, dtype=FLASHINFER_BMM_FP8_DTYPE, device=self.device)
-
-    def empty_fp32_scalar(self) -> torch.Tensor:
-        return torch.empty([], dtype=torch.float32, device=self.device)
-
-    def get_inputs(self) -> list[torch.Tensor]:
-        return [
-            self.empty_fp8(128, 16),
-            self.empty_fp8(16, 16),
-            self.empty_fp32_scalar(),
-            self.empty_fp32_scalar(),
-        ]
-
-
-class FlashInferBMMFP8ReduceScatterPattern(_FlashInferCollectivePatternBase):
+class FlashInferBMMFP8ReduceScatterPattern(BasePattern):
     def register(self, pm_pass: PatternMatcherPass) -> None:
-        def pattern(
-            a_2d: torch.Tensor,
-            b_2d: torch.Tensor,
-            a_scale: torch.Tensor,
-            b_scale: torch.Tensor,
-        ) -> torch.Tensor:
-            a = torch.ops.aten.unsqueeze.default(a_2d, 0)
-            b = torch.ops.aten.unsqueeze.default(b_2d, 0)
-            bmm = torch.ops.vllm.bmm_fp8.default(
-                a, b, a_scale, b_scale, self.dtype, "auto"
-            )
-            output = torch.ops.aten.view.default(bmm, [a_2d.shape[0], b_2d.shape[1]])
-            return torch.ops.vllm.reduce_scatter.default(
-                output, 0, self.tp_size, self.tp.unique_name
-            )
-
-        def replacement(
-            a_2d: torch.Tensor,
-            b_2d: torch.Tensor,
-            a_scale: torch.Tensor,
-            b_scale: torch.Tensor,
-        ) -> torch.Tensor:
-            output_shape = [a_2d.shape[0], b_2d.shape[1]]
-            return torch.ops.vllm.fused_flashinfer_scaled_matmul_reduce_scatter.default(
-                a_2d,
-                b_2d,
-                a_scale,
-                b_scale,
-                "sum",
-                0,
-                0,
-                self.tp.unique_name,
-                output_shape,
-                self.dtype,
-            )
-
         def extra_check(match: pm.Match) -> bool:
             parsed = _get_match_bmm_fp8(match)
             if parsed is None:
@@ -738,72 +685,89 @@ class FlashInferBMMFP8ReduceScatterPattern(_FlashInferCollectivePatternBase):
                 _passes_min_m_after_reduce_scatter(parsed.a_2d, self.tp_size)
             )
 
-        pm.register_replacement(
-            pattern,
-            replacement,
-            self.get_inputs(),
-            pm.fwd_only,
-            pm_pass,
-            extra_check=extra_check,
-        )
-
-
-class FlashInferAllGatherBMMFP8Pattern(_FlashInferCollectivePatternBase):
-    def register(self, pm_pass: PatternMatcherPass) -> None:
-        def pattern(
-            a_shard_2d: torch.Tensor,
-            b_2d: torch.Tensor,
-            a_scale: torch.Tensor,
-            b_scale: torch.Tensor,
-        ) -> torch.Tensor:
-            gathered = torch.ops.vllm.all_gather.default(
-                a_shard_2d, 0, self.tp_size, self.tp.unique_name
-            )
-            a = torch.ops.aten.unsqueeze.default(gathered, 0)
-            b = torch.ops.aten.unsqueeze.default(b_2d, 0)
-            bmm = torch.ops.vllm.bmm_fp8.default(
-                a, b, a_scale, b_scale, self.dtype, "auto"
-            )
-            return torch.ops.aten.view.default(bmm, [gathered.shape[0], b_2d.shape[1]])
-
-        def replacement(
-            a_shard_2d: torch.Tensor,
-            b_2d: torch.Tensor,
-            a_scale: torch.Tensor,
-            b_scale: torch.Tensor,
-        ) -> torch.Tensor:
-            return torch.ops.vllm.fused_all_gather_flashinfer_scaled_matmul.default(
-                a_shard_2d,
-                b_2d,
-                a_scale,
-                b_scale,
+        def make_pattern(output_op):
+            return pm.CallFunction(
+                torch.ops.vllm.reduce_scatter.default,
+                pm.CallFunction(
+                    output_op,
+                    pm.CallFunction(
+                        torch.ops.vllm.bmm_fp8.default,
+                        pm.CallFunction(
+                            torch.ops.aten.unsqueeze.default,
+                            pm.KeywordArg("a_2d"),
+                            0,
+                        ),
+                        pm.CallFunction(
+                            torch.ops.aten.unsqueeze.default,
+                            pm.KeywordArg("b_2d"),
+                            0,
+                        ),
+                        pm.KeywordArg("a_scale"),
+                        pm.KeywordArg("b_scale"),
+                        self.dtype,
+                        "auto",
+                    ),
+                    pm.Ignored(),
+                ),
                 0,
+                self.tp_size,
                 self.tp.unique_name,
-                self.dtype,
             )
 
+        def make_handler(pattern):
+            @pm.register_graph_pattern(
+                pattern,
+                pass_dict=pm_pass,
+                extra_check=extra_check,
+            )
+            def handler(
+                match: pm.Match,
+                a_2d: fx.Node,
+                b_2d: fx.Node,
+                a_scale: object,
+                b_scale: object,
+            ) -> None:
+                reduce_scatter = _find_match_node(
+                    match, torch.ops.vllm.reduce_scatter.default
+                )
+                if reduce_scatter is None:
+                    return
+
+                with match.graph.inserting_before(reduce_scatter):
+                    replacement = match.graph.call_function(
+                        torch.ops.vllm.fused_flashinfer_scaled_matmul_reduce_scatter.default,
+                        args=(
+                            a_2d,
+                            b_2d,
+                            a_scale,
+                            b_scale,
+                            "sum",
+                            0,
+                            0,
+                            self.tp.unique_name,
+                            [a_2d.meta["val"].shape[0], b_2d.meta["val"].shape[1]],
+                            self.dtype,
+                        ),
+                    )
+                _copy_replacement_meta(reduce_scatter, replacement)
+                reduce_scatter.replace_all_uses_with(replacement)
+                match.erase_nodes()
+
+        for output_op in VIEW_LIKE_OPS:
+            make_handler(make_pattern(output_op))
+
+
+class FlashInferAllGatherBMMFP8Pattern(BasePattern):
+    def register(self, pm_pass: PatternMatcherPass) -> None:
         def extra_check(match: pm.Match) -> bool:
             parsed = _get_match_bmm_fp8(match)
             if parsed is None:
                 return False
             return _flashinfer_bmm_fp8_extra_check(match) and _passes_min_m(parsed.a_2d)
 
-        pm.register_replacement(
-            pattern,
-            replacement,
-            self.get_inputs(),
-            pm.fwd_only,
-            pm_pass,
-            extra_check=extra_check,
-        )
-
-
-class FlashInferAllGatherBMMFP8QKVPattern(_FlashInferCollectivePatternBase):
-    def register(self, pm_pass: PatternMatcherPass) -> None:
-        pattern = pm.CallFunction(
-            torch.ops.aten.split_with_sizes.default,
-            pm.CallFunction(
-                torch.ops.aten.view.default,
+        def make_pattern(output_op):
+            return pm.CallFunction(
+                output_op,
                 pm.CallFunction(
                     torch.ops.vllm.bmm_fp8.default,
                     pm.CallFunction(
@@ -826,16 +790,58 @@ class FlashInferAllGatherBMMFP8QKVPattern(_FlashInferCollectivePatternBase):
                     pm.KeywordArg("b_scale"),
                     self.dtype,
                     "auto",
-                    _users=pm.MULTIPLE,
                 ),
                 pm.Ignored(),
-                _users=pm.MULTIPLE,
-            ),
-            pm.Ignored(),
-            pm.Ignored(),
-            _users=pm.MULTIPLE,
-        )
+            )
 
+        def make_handler(pattern):
+            @pm.register_graph_pattern(
+                pattern,
+                pass_dict=pm_pass,
+                extra_check=extra_check,
+            )
+            def handler(
+                match: pm.Match,
+                a_shard_2d: fx.Node,
+                b_2d: fx.Node,
+                a_scale: object,
+                b_scale: object,
+            ) -> None:
+                output_node = _find_match_node(match, torch.ops.aten.view.default)
+                if output_node is None:
+                    output_node = _find_match_node(
+                        match, torch.ops.aten.reshape.default
+                    )
+                if output_node is None:
+                    output_node = _find_match_node(
+                        match, torch.ops.aten._unsafe_view.default
+                    )
+                if output_node is None:
+                    return
+
+                with match.graph.inserting_before(output_node):
+                    replacement = match.graph.call_function(
+                        torch.ops.vllm.fused_all_gather_flashinfer_scaled_matmul.default,
+                        args=(
+                            a_shard_2d,
+                            b_2d,
+                            a_scale,
+                            b_scale,
+                            0,
+                            self.tp.unique_name,
+                            self.dtype,
+                        ),
+                    )
+                _copy_replacement_meta(output_node, replacement)
+                output_node.replace_all_uses_with(replacement)
+                match.erase_nodes()
+
+        for output_op in VIEW_LIKE_OPS:
+            make_handler(make_pattern(output_op))
+
+
+class FlashInferAllGatherBMMFP8QKVPattern(BasePattern):
+    def register(self, pm_pass: PatternMatcherPass) -> None:
         def extra_check(match: pm.Match) -> bool:
             if not _flashinfer_bmm_fp8_extra_check(match):
                 return False
@@ -849,31 +855,74 @@ class FlashInferAllGatherBMMFP8QKVPattern(_FlashInferCollectivePatternBase):
             ag_match = _match_ag_bmm_from_split(split_node)
             return ag_match is not None and _passes_min_m(ag_match.replace_nodes[0])
 
-        @pm.register_graph_pattern(
-            pattern,
-            pass_dict=pm_pass,
-            extra_check=extra_check,
-        )
-        def handler(
-            match: pm.Match,
-            a_shard_2d: fx.Node,
-            b_2d: fx.Node,
-            a_scale: object,
-            b_scale: object,
-        ) -> None:
-            del a_shard_2d, b_2d, a_scale, b_scale
-            split_node = _find_match_node(
-                match, torch.ops.aten.split_with_sizes.default
+        def make_pattern(output_op):
+            return pm.CallFunction(
+                torch.ops.aten.split_with_sizes.default,
+                pm.CallFunction(
+                    output_op,
+                    pm.CallFunction(
+                        torch.ops.vllm.bmm_fp8.default,
+                        pm.CallFunction(
+                            torch.ops.aten.unsqueeze.default,
+                            pm.CallFunction(
+                                torch.ops.vllm.all_gather.default,
+                                pm.KeywordArg("a_shard_2d"),
+                                0,
+                                self.tp_size,
+                                self.tp.unique_name,
+                            ),
+                            0,
+                        ),
+                        pm.CallFunction(
+                            torch.ops.aten.unsqueeze.default,
+                            pm.KeywordArg("b_2d"),
+                            0,
+                        ),
+                        pm.KeywordArg("a_scale"),
+                        pm.KeywordArg("b_scale"),
+                        self.dtype,
+                        "auto",
+                        _users=pm.MULTIPLE,
+                    ),
+                    pm.Ignored(),
+                    _users=pm.MULTIPLE,
+                ),
+                pm.Ignored(),
+                pm.Ignored(),
+                _users=pm.MULTIPLE,
             )
-            if split_node is None:
-                return
 
-            ag_match = _match_ag_bmm_from_split(split_node)
-            if ag_match is None or not _passes_min_m(ag_match.replace_nodes[0]):
-                return
+        def make_handler(pattern):
+            @pm.register_graph_pattern(
+                pattern,
+                pass_dict=pm_pass,
+                extra_check=extra_check,
+            )
+            def handler(
+                match: pm.Match,
+                a_shard_2d: fx.Node,
+                b_2d: fx.Node,
+                a_scale: object,
+                b_scale: object,
+            ) -> None:
+                del a_shard_2d, b_2d, a_scale, b_scale
+                split_node = _find_match_node(
+                    match, torch.ops.aten.split_with_sizes.default
+                )
+                if split_node is None:
+                    return
 
-            _lower_ag_bmm(match.graph, ag_match)
-            match.erase_nodes()
+                ag_match = _match_ag_bmm_from_split(split_node)
+                if ag_match is None or not _passes_min_m(ag_match.replace_nodes[0]):
+                    return
+
+                _lower_ag_bmm(match.graph, ag_match)
+                match.erase_nodes()
+
+            return handler
+
+        for output_op in VIEW_LIKE_OPS:
+            make_handler(make_pattern(output_op))
 
 
 def register_flashinfer_bmm_fp8_collective_patterns(
