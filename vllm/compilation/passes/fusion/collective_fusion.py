@@ -388,10 +388,6 @@ VIEW_LIKE_OPS = (
     torch.ops.aten.squeeze.dim,
     torch.ops.aten.squeeze.default,
 )
-LAYOUT_PRESERVING_OPS = (
-    torch.ops.aten.contiguous.default,
-    torch.ops.aten.clone.default,
-)
 
 
 def _get_node_arg(node: fx.Node, name: str, index: int) -> object:
@@ -402,10 +398,6 @@ def _is_view_like(node: fx.Node) -> bool:
     return any(is_func(node, op) for op in VIEW_LIKE_OPS)
 
 
-def _is_passthrough(node: fx.Node) -> bool:
-    return _is_view_like(node) or any(is_func(node, op) for op in LAYOUT_PRESERVING_OPS)
-
-
 def _strip_view_like(node: fx.Node) -> fx.Node:
     while _is_view_like(node):
         parent = node.args[0]
@@ -413,49 +405,6 @@ def _strip_view_like(node: fx.Node) -> fx.Node:
             break
         node = parent
     return node
-
-
-@dataclass(frozen=True)
-class _UserPathState:
-    node: fx.Node
-    saw_slice_scatter: bool = False
-
-
-def _walk_user_paths(
-    start_nodes: list[fx.Node],
-    *,
-    track_slice_scatter: bool = False,
-) -> list[_UserPathState]:
-    worklist = [_UserPathState(node=user) for user in start_nodes]
-    visited: set[_UserPathState] = set()
-    reachable: list[_UserPathState] = []
-
-    while worklist:
-        state = worklist.pop()
-        if state in visited:
-            continue
-        visited.add(state)
-        reachable.append(state)
-
-        if _is_passthrough(state.node):
-            worklist.extend(
-                _UserPathState(
-                    node=child,
-                    saw_slice_scatter=state.saw_slice_scatter,
-                )
-                for child in state.node.users
-            )
-            continue
-
-        if track_slice_scatter and is_func(
-            state.node, torch.ops.aten.slice_scatter.default
-        ):
-            worklist.extend(
-                _UserPathState(node=child, saw_slice_scatter=True)
-                for child in state.node.users
-            )
-
-    return reachable
 
 
 def _node_shape(node: fx.Node) -> list[object] | None:
@@ -664,17 +613,6 @@ def _is_qkv_split(node: fx.Node) -> bool:
     )
 
 
-def _classify_qkv_branch(node: fx.Node) -> str | None:
-    if any(_is_qkv_split(state.node) for state in _walk_user_paths(list(node.users))):
-        return "direct"
-    if any(
-        state.saw_slice_scatter and _is_qkv_split(state.node)
-        for state in _walk_user_paths(list(node.users), track_slice_scatter=True)
-    ):
-        return "rotary"
-    return None
-
-
 class FlashInferBMMFP8ReduceScatterPattern(BasePattern):
     def register(self, pm_pass: PatternMatcherPass) -> None:
         def extra_check(match: pm.Match) -> bool:
@@ -842,57 +780,56 @@ class FlashInferAllGatherBMMFP8Pattern(BasePattern):
 
 class FlashInferAllGatherBMMFP8QKVPattern(BasePattern):
     def register(self, pm_pass: PatternMatcherPass) -> None:
-        def extra_check(match: pm.Match) -> bool:
-            if not _flashinfer_bmm_fp8_extra_check(match):
-                return False
-
-            split_node = _find_match_node(
-                match, torch.ops.aten.split_with_sizes.default
-            )
-            if split_node is None:
-                return False
-
-            ag_match = _match_ag_bmm_from_split(split_node)
-            return ag_match is not None and _passes_min_m(ag_match.replace_nodes[0])
-
         def make_pattern(output_op):
-            return pm.CallFunction(
-                torch.ops.aten.split_with_sizes.default,
+            bmm = pm.CallFunction(
+                torch.ops.vllm.bmm_fp8.default,
                 pm.CallFunction(
-                    output_op,
+                    torch.ops.aten.unsqueeze.default,
                     pm.CallFunction(
-                        torch.ops.vllm.bmm_fp8.default,
-                        pm.CallFunction(
-                            torch.ops.aten.unsqueeze.default,
-                            pm.CallFunction(
-                                torch.ops.vllm.all_gather.default,
-                                pm.KeywordArg("a_shard_2d"),
-                                0,
-                                self.tp_size,
-                                self.tp.unique_name,
-                            ),
-                            0,
-                        ),
-                        pm.CallFunction(
-                            torch.ops.aten.unsqueeze.default,
-                            pm.KeywordArg("b_2d"),
-                            0,
-                        ),
-                        pm.KeywordArg("a_scale"),
-                        pm.KeywordArg("b_scale"),
-                        self.dtype,
-                        "auto",
-                        _users=pm.MULTIPLE,
+                        torch.ops.vllm.all_gather.default,
+                        pm.KeywordArg("a_shard_2d"),
+                        0,
+                        self.tp_size,
+                        self.tp.unique_name,
                     ),
-                    pm.Ignored(),
-                    _users=pm.MULTIPLE,
+                    0,
                 ),
+                pm.CallFunction(
+                    torch.ops.aten.unsqueeze.default,
+                    pm.KeywordArg("b_2d"),
+                    0,
+                ),
+                pm.KeywordArg("a_scale"),
+                pm.KeywordArg("b_scale"),
+                self.dtype,
+                "auto",
+                _users=1,
+            )
+            replace_node = pm.CallFunction(
+                output_op,
+                bmm,
+                pm.Ignored(),
+                _users=1,
+            )
+            pattern = pm.CallFunction(
+                torch.ops.aten.split_with_sizes.default,
+                replace_node,
                 pm.Ignored(),
                 pm.Ignored(),
                 _users=pm.MULTIPLE,
             )
+            return pattern, replace_node
 
-        def make_handler(pattern):
+        def make_handler(pattern, replace_pattern):
+            def extra_check(match: pm.Match) -> bool:
+                split_node = match.output_node()
+                replace_node = match.ctx.pattern_to_node[replace_pattern]
+                return (
+                    _is_qkv_split(split_node)
+                    and _flashinfer_bmm_fp8_extra_check(match)
+                    and _passes_min_m(replace_node)
+                )
+
             @pm.register_graph_pattern(
                 pattern,
                 pass_dict=pm_pass,
@@ -905,24 +842,154 @@ class FlashInferAllGatherBMMFP8QKVPattern(BasePattern):
                 a_scale: object,
                 b_scale: object,
             ) -> None:
-                del a_shard_2d, b_2d, a_scale, b_scale
-                split_node = _find_match_node(
-                    match, torch.ops.aten.split_with_sizes.default
+                replace_node = match.ctx.pattern_to_node[replace_pattern]
+                _lower_ag_bmm(
+                    match.graph,
+                    [replace_node],
+                    a_shard_2d,
+                    b_2d,
+                    a_scale,
+                    b_scale,
+                    self.tp.unique_name,
+                    self.dtype,
                 )
-                if split_node is None:
-                    return
-
-                ag_match = _match_ag_bmm_from_split(split_node)
-                if ag_match is None or not _passes_min_m(ag_match.replace_nodes[0]):
-                    return
-
-                _lower_ag_bmm(match.graph, ag_match)
                 match.erase_nodes()
 
             return handler
 
         for output_op in VIEW_LIKE_OPS:
-            make_handler(make_pattern(output_op))
+            pattern, replace_pattern = make_pattern(output_op)
+            make_handler(pattern, replace_pattern)
+
+
+class FlashInferAllGatherBMMFP8QKVRotaryPattern(BasePattern):
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def make_pattern(direct_output_op, rotary_output_op):
+            bmm = pm.CallFunction(
+                torch.ops.vllm.bmm_fp8.default,
+                pm.CallFunction(
+                    torch.ops.aten.unsqueeze.default,
+                    pm.CallFunction(
+                        torch.ops.vllm.all_gather.default,
+                        pm.KeywordArg("a_shard_2d"),
+                        0,
+                        self.tp_size,
+                        self.tp.unique_name,
+                    ),
+                    0,
+                ),
+                pm.CallFunction(
+                    torch.ops.aten.unsqueeze.default,
+                    pm.KeywordArg("b_2d"),
+                    0,
+                ),
+                pm.KeywordArg("a_scale"),
+                pm.KeywordArg("b_scale"),
+                self.dtype,
+                "auto",
+                _users=2,
+            )
+            direct_replace = pm.CallFunction(
+                direct_output_op,
+                bmm,
+                pm.Ignored(),
+                _users=1,
+            )
+            rotary_replace = pm.CallFunction(
+                rotary_output_op,
+                bmm,
+                pm.Ignored(),
+                _users=1,
+            )
+            direct_split = pm.CallFunction(
+                torch.ops.aten.split_with_sizes.default,
+                direct_replace,
+                pm.Ignored(),
+                pm.Ignored(),
+                _users=pm.MULTIPLE,
+            )
+            rotary_split = pm.CallFunction(
+                torch.ops.aten.split_with_sizes.default,
+                pm.CallFunction(
+                    torch.ops.aten.slice_scatter.default,
+                    pm.CallFunction(
+                        torch.ops.aten.slice_scatter.default,
+                        rotary_replace,
+                        pm.Ignored(),
+                        pm.Ignored(),
+                        pm.Ignored(),
+                        pm.Ignored(),
+                        _users=1,
+                    ),
+                    pm.Ignored(),
+                    pm.Ignored(),
+                    pm.Ignored(),
+                    pm.Ignored(),
+                    _users=1,
+                ),
+                pm.Ignored(),
+                pm.Ignored(),
+                _users=pm.MULTIPLE,
+            )
+            return (
+                pm.MultiOutputPattern([direct_split, rotary_split]),
+                direct_replace,
+                rotary_replace,
+            )
+
+        def make_handler(pattern, direct_replace_pattern, rotary_replace_pattern):
+            def extra_check(match: pm.Match) -> bool:
+                direct_split, rotary_split = match.output_nodes()
+                direct_replace = match.ctx.pattern_to_node[direct_replace_pattern]
+                return (
+                    direct_split is not None
+                    and rotary_split is not None
+                    and _is_qkv_split(direct_split)
+                    and _is_qkv_split(rotary_split)
+                    and _flashinfer_bmm_fp8_extra_check(match)
+                    and _passes_min_m(direct_replace)
+                )
+
+            @pm.register_graph_pattern(
+                pattern,
+                pass_dict=pm_pass,
+                extra_check=extra_check,
+            )
+            def handler(
+                match: pm.Match,
+                a_shard_2d: fx.Node,
+                b_2d: fx.Node,
+                a_scale: object,
+                b_scale: object,
+            ) -> None:
+                direct_replace = match.ctx.pattern_to_node[direct_replace_pattern]
+                rotary_replace = match.ctx.pattern_to_node[rotary_replace_pattern]
+                _lower_ag_bmm(
+                    match.graph,
+                    [direct_replace, rotary_replace],
+                    a_shard_2d,
+                    b_2d,
+                    a_scale,
+                    b_scale,
+                    self.tp.unique_name,
+                    self.dtype,
+                )
+                match.erase_nodes()
+
+            return handler
+
+        for direct_output_op in VIEW_LIKE_OPS:
+            for rotary_output_op in VIEW_LIKE_OPS:
+                (
+                    pattern,
+                    direct_replace_pattern,
+                    rotary_replace_pattern,
+                ) = make_pattern(direct_output_op, rotary_output_op)
+                make_handler(
+                    pattern,
+                    direct_replace_pattern,
+                    rotary_replace_pattern,
+                )
 
 
 def register_flashinfer_bmm_fp8_collective_patterns(
@@ -932,78 +999,8 @@ def register_flashinfer_bmm_fp8_collective_patterns(
 ) -> None:
     FlashInferBMMFP8ReduceScatterPattern(dtype, device).register(pm_pass)
     FlashInferAllGatherBMMFP8Pattern(dtype, device).register(pm_pass)
+    FlashInferAllGatherBMMFP8QKVRotaryPattern(dtype, device).register(pm_pass)
     FlashInferAllGatherBMMFP8QKVPattern(dtype, device).register(pm_pass)
-
-
-@dataclass
-class _FP8CollectiveGemmMatch:
-    replace_nodes: list[fx.Node]
-    a_2d: fx.Node
-    b_2d: fx.Node
-    a_scale: object
-    b_scale: object
-    out_dtype: object
-    group_name: str
-
-
-def _match_ag_bmm_from_split(
-    split_node: fx.Node,
-) -> _FP8CollectiveGemmMatch | None:
-    if not _is_qkv_split(split_node):
-        return None
-
-    split_input = _get_node_arg(split_node, "self", 0)
-    if (
-        not isinstance(split_input, fx.Node)
-        or not _is_passthrough(split_input)
-        or _node_ndim(split_input) != 2
-    ):
-        return None
-
-    bmm_node = _strip_view_like(split_input)
-    parsed_bmm = _parse_bmm_fp8(bmm_node)
-    if parsed_bmm is None or not _is_supported_flashinfer_bmm_fp8(parsed_bmm):
-        return None
-
-    ag_node = _strip_view_like(parsed_bmm.a_2d)
-    parsed_ag = _parse_all_gather(ag_node)
-    if parsed_ag is None:
-        return None
-
-    parsed_group_name = _parse_collective_group_name(parsed_ag)
-    if parsed_group_name is None:
-        return None
-
-    replace_nodes = [split_input]
-    sibling_targets = [
-        user
-        for user in bmm_node.users
-        if user is not split_input
-        and _is_passthrough(user)
-        and _node_ndim(user) == 2
-        and _node_shape(user) == _node_shape(split_input)
-    ]
-    if sibling_targets:
-        if len(sibling_targets) != 1:
-            return None
-
-        branch_kinds = {
-            _classify_qkv_branch(split_input),
-            _classify_qkv_branch(sibling_targets[0]),
-        }
-        if branch_kinds != {"direct", "rotary"}:
-            return None
-        replace_nodes.append(sibling_targets[0])
-
-    return _FP8CollectiveGemmMatch(
-        replace_nodes=replace_nodes,
-        a_2d=parsed_ag.input_node,
-        b_2d=parsed_bmm.b_2d,
-        a_scale=parsed_bmm.a_scale,
-        b_scale=parsed_bmm.b_scale,
-        out_dtype=parsed_bmm.out_dtype,
-        group_name=parsed_group_name,
-    )
 
 
 def _first_node_in_graph(graph: fx.Graph, nodes: list[fx.Node]) -> fx.Node:
@@ -1011,26 +1008,35 @@ def _first_node_in_graph(graph: fx.Graph, nodes: list[fx.Node]) -> fx.Node:
     return min(nodes, key=node_order.__getitem__)
 
 
-def _lower_ag_bmm(graph: fx.Graph, match: _FP8CollectiveGemmMatch) -> None:
-    replace_node = _first_node_in_graph(graph, match.replace_nodes)
+def _lower_ag_bmm(
+    graph: fx.Graph,
+    replace_nodes: list[fx.Node],
+    a_2d: fx.Node,
+    b_2d: fx.Node,
+    a_scale: object,
+    b_scale: object,
+    group_name: str,
+    out_dtype: object,
+) -> None:
+    replace_node = _first_node_in_graph(graph, replace_nodes)
     with graph.inserting_before(replace_node):
         replacement = graph.call_function(
             torch.ops.vllm.fused_all_gather_flashinfer_scaled_matmul.default,
             args=(
-                match.a_2d,
-                match.b_2d,
-                match.a_scale,
-                match.b_scale,
+                a_2d,
+                b_2d,
+                a_scale,
+                b_scale,
                 0,
-                match.group_name,
-                match.out_dtype,
+                group_name,
+                out_dtype,
             ),
         )
 
     _copy_replacement_meta(replace_node, replacement)
-    for node in match.replace_nodes:
+    for node in replace_nodes:
         node.replace_all_uses_with(replacement)
-    for node in match.replace_nodes:
+    for node in replace_nodes:
         graph.erase_node(node)
 
 
