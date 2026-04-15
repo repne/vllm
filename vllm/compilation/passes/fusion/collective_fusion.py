@@ -549,19 +549,6 @@ def _get_match_bmm_fp8(match: pm.Match) -> _BmmFp8Op | None:
     return _parse_bmm_fp8(node)
 
 
-def _is_qkv_split(node: fx.Node) -> bool:
-    if not is_func(node, torch.ops.aten.split_with_sizes.default):
-        return False
-
-    split_sizes = _get_node_arg(node, "split_sizes", 1)
-    dim = _get_node_arg(node, "dim", 2)
-    return (
-        isinstance(split_sizes, (list, tuple))
-        and len(split_sizes) == 3
-        and dim in (-1, 1)
-    )
-
-
 def _apply_view_like_to_bmm_output(
     tensor: torch.Tensor,
     output_op,
@@ -571,51 +558,6 @@ def _apply_view_like_to_bmm_output(
     if output_op is torch.ops.aten.squeeze.dim:
         return output_op(tensor, 0)
     return output_op(tensor, list(tensor.shape[1:]))
-
-
-def _has_qkv_split_user(node: fx.Node) -> bool:
-    return any(_is_qkv_split(user) for user in node.users)
-
-
-def _has_rotary_qkv_split_user(node: fx.Node) -> bool:
-    for first_slice_scatter in node.users:
-        if not is_func(first_slice_scatter, torch.ops.aten.slice_scatter.default):
-            continue
-        for second_slice_scatter in first_slice_scatter.users:
-            if not is_func(second_slice_scatter, torch.ops.aten.slice_scatter.default):
-                continue
-            if any(_is_qkv_split(user) for user in second_slice_scatter.users):
-                return True
-    return False
-
-
-def _is_rotary_qkv_view_node(node: fx.Node) -> bool:
-    if not _is_view_like(node):
-        return False
-
-    bmm = node.args[0] if node.args else None
-    if not isinstance(bmm, fx.Node) or not is_func(bmm, torch.ops.vllm.bmm_fp8.default):
-        return False
-
-    direct_view = None
-    rotary_view = None
-    for user in bmm.users:
-        if not _is_view_like(user):
-            continue
-        if _has_qkv_split_user(user):
-            direct_view = user
-        if _has_rotary_qkv_split_user(user):
-            rotary_view = user
-
-    return (
-        direct_view is not None
-        and rotary_view is not None
-        and node
-        in (
-            direct_view,
-            rotary_view,
-        )
-    )
 
 
 class FlashInferBMMFP8ReduceScatterPattern(BasePattern):
@@ -708,38 +650,31 @@ class FlashInferAllGatherBMMFP8Pattern(BasePattern):
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
         def extra_check(match: pm.Match) -> bool:
-            output_node = match.output_node()
-            return (
-                output_node is not None
-                and _flashinfer_bmm_fp8_extra_check(match)
-                and _passes_min_m(output_node)
-                and not _is_rotary_qkv_view_node(output_node)
+            parsed = _get_match_bmm_fp8(match)
+            if parsed is None:
+                return False
+            return _flashinfer_bmm_fp8_extra_check(match) and _passes_min_m(parsed.a_2d)
+
+        def pattern(
+            a_shard_2d: torch.Tensor,
+            b_2d: torch.Tensor,
+            a_scale: torch.Tensor,
+            b_scale: torch.Tensor,
+        ) -> torch.Tensor:
+            all_gather = torch.ops.vllm.all_gather.default(
+                a_shard_2d,
+                dim=0,
+                world_size=self.tp_size,
+                group_name=self.tp.unique_name,
             )
-
-        def make_pattern(output_op):
-            def pattern(
-                a_shard_2d: torch.Tensor,
-                b_2d: torch.Tensor,
-                a_scale: torch.Tensor,
-                b_scale: torch.Tensor,
-            ) -> torch.Tensor:
-                all_gather = torch.ops.vllm.all_gather.default(
-                    a_shard_2d,
-                    dim=0,
-                    world_size=self.tp_size,
-                    group_name=self.tp.unique_name,
-                )
-                bmm = torch.ops.vllm.bmm_fp8.default(
-                    torch.ops.aten.unsqueeze.default(all_gather, 0),
-                    torch.ops.aten.unsqueeze.default(b_2d, 0),
-                    a_scale,
-                    b_scale,
-                    self.dtype,
-                    "auto",
-                )
-                return _apply_view_like_to_bmm_output(bmm, output_op)
-
-            return pattern
+            return torch.ops.vllm.bmm_fp8.default(
+                torch.ops.aten.unsqueeze.default(all_gather, 0),
+                torch.ops.aten.unsqueeze.default(b_2d, 0),
+                a_scale,
+                b_scale,
+                self.dtype,
+                "auto",
+            )
 
         def replacement(
             a_shard_2d: torch.Tensor,
@@ -747,86 +682,6 @@ class FlashInferAllGatherBMMFP8Pattern(BasePattern):
             a_scale: torch.Tensor,
             b_scale: torch.Tensor,
         ) -> torch.Tensor:
-            return torch.ops.vllm.fused_all_gather_flashinfer_scaled_matmul.default(
-                a_shard_2d,
-                b_2d,
-                a_scale,
-                b_scale,
-                0,
-                self.tp.unique_name,
-                self.dtype,
-            )
-
-        for output_op in VIEW_LIKE_OPS:
-            pm.register_replacement(
-                make_pattern(output_op),
-                replacement,
-                self.get_inputs(),
-                pm.fwd_only,
-                pm_pass,
-                extra_check=extra_check,
-                skip_duplicates=True,
-            )
-
-
-class FlashInferAllGatherBMMFP8QKVRotaryPattern(BasePattern):
-    def get_inputs(self) -> list[torch.Tensor]:
-        a_shard_2d = torch.empty([8, 16], device=self.device, dtype=FP8_DTYPE)
-        b_2d = (
-            torch.empty([16, 16], device=self.device, dtype=FP8_DTYPE)
-            .contiguous()
-            .transpose(0, 1)
-        )
-        a_scale = torch.empty([1], device=self.device, dtype=torch.float32)
-        b_scale = torch.empty([1], device=self.device, dtype=torch.float32)
-        return [a_shard_2d, b_2d, a_scale, b_scale]
-
-    def register(self, pm_pass: PatternMatcherPass) -> None:
-        def make_pattern(direct_output_op, rotary_output_op):
-            def pattern(
-                a_shard_2d: torch.Tensor,
-                b_2d: torch.Tensor,
-                a_scale: torch.Tensor,
-                b_scale: torch.Tensor,
-            ) -> tuple[torch.Tensor, torch.Tensor]:
-                all_gather = torch.ops.vllm.all_gather.default(
-                    a_shard_2d,
-                    dim=0,
-                    world_size=self.tp_size,
-                    group_name=self.tp.unique_name,
-                )
-                bmm = torch.ops.vllm.bmm_fp8.default(
-                    torch.ops.aten.unsqueeze.default(all_gather, 0),
-                    torch.ops.aten.unsqueeze.default(b_2d, 0),
-                    a_scale,
-                    b_scale,
-                    self.dtype,
-                    "auto",
-                )
-                return (
-                    _apply_view_like_to_bmm_output(bmm, direct_output_op),
-                    _apply_view_like_to_bmm_output(bmm, rotary_output_op),
-                )
-
-            return pattern
-
-        def extra_check(match: pm.Match) -> bool:
-            direct_view, rotary_view = match.output_nodes()
-            return (
-                direct_view is not None
-                and rotary_view is not None
-                and _has_qkv_split_user(direct_view)
-                and _has_rotary_qkv_split_user(rotary_view)
-                and _flashinfer_bmm_fp8_extra_check(match)
-                and _passes_min_m(direct_view)
-            )
-
-        def replacement(
-            a_shard_2d: torch.Tensor,
-            b_2d: torch.Tensor,
-            a_scale: torch.Tensor,
-            b_scale: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
             fused = torch.ops.vllm.fused_all_gather_flashinfer_scaled_matmul.default(
                 a_shard_2d,
                 b_2d,
@@ -836,19 +691,16 @@ class FlashInferAllGatherBMMFP8QKVRotaryPattern(BasePattern):
                 self.tp.unique_name,
                 self.dtype,
             )
-            return fused, fused
+            return torch.ops.aten.unsqueeze.default(fused, 0)
 
-        for direct_output_op in VIEW_LIKE_OPS:
-            for rotary_output_op in VIEW_LIKE_OPS:
-                pm.register_replacement(
-                    make_pattern(direct_output_op, rotary_output_op),
-                    replacement,
-                    self.get_inputs(),
-                    pm.fwd_only,
-                    pm_pass,
-                    extra_check=extra_check,
-                    skip_duplicates=True,
-                )
+        pm.register_replacement(
+            pattern,
+            replacement,
+            self.get_inputs(),
+            pm.fwd_only,
+            pm_pass,
+            extra_check=extra_check,
+        )
 
 
 def register_flashinfer_bmm_fp8_collective_patterns(
@@ -857,7 +709,6 @@ def register_flashinfer_bmm_fp8_collective_patterns(
     device: str | None,
 ) -> None:
     FlashInferBMMFP8ReduceScatterPattern(dtype, device).register(pm_pass)
-    FlashInferAllGatherBMMFP8QKVRotaryPattern(dtype, device).register(pm_pass)
     FlashInferAllGatherBMMFP8Pattern(dtype, device).register(pm_pass)
 
 
