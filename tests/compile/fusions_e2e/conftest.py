@@ -163,7 +163,8 @@ def run_e2e_fusion_test(monkeypatch, caplog_mp_spawn):
                 )
                 num_ranges_activated = len(log_matches) // tp_size
             elif (
-                match_name in ("ar_rms_fusion", "sequence_parallel")
+                match_name in ("ar_rms_fusion", "sequence_parallel", "async_tp")
+                and "sequence_parallel" in matches_check
                 and num_compile_ranges >= 2
             ):
                 num_ranges_activated = num_compile_ranges - 1
@@ -201,7 +202,7 @@ def run_e2e_fusion_test(monkeypatch, caplog_mp_spawn):
                 and "sequence_parallel" in matches_check
                 and num_compile_ranges >= 2
             ):
-                # AsyncTP only finds patterns on ranges where SP ran.
+                # AsyncTP only runs on ranges where SP ran.
                 n_sp_ranges = num_compile_ranges - 1
                 assert (
                     sum(m == expected_matches for m in log_matches)
@@ -210,10 +211,6 @@ def run_e2e_fusion_test(monkeypatch, caplog_mp_spawn):
                     f"Expecting {expected_matches} async_tp on "
                     f"{tp_size * n_sp_ranges} SP-range entries, "
                     f"found: {log_matches}"
-                )
-                assert sum(m == 0 for m in log_matches) == tp_size, (
-                    f"Expecting 0 async_tp on {tp_size} small-range entries "
-                    f"(no SP), found: {log_matches}"
                 )
             elif (
                 match_name == "ar_rms_fusion"
@@ -272,6 +269,23 @@ def run_e2e_fusion_test(monkeypatch, caplog_mp_spawn):
                 n_expected = tp_size * (num_compile_ranges - num_ranges_activated)
                 assert len(log_matches) == n_expected, (
                     f'Could not find {n_expected} "Skipping SequenceParallelismPass" '
+                    f"(found {len(log_matches)}) in:\n {log_holder.text}"
+                )
+
+            if (
+                match_name == "async_tp"
+                and "sequence_parallel" in matches_check
+                and num_compile_ranges >= 2
+            ):
+                log_matches = re.findall(
+                    r"pass_manager.py:\d+] Skipping "
+                    r".*AsyncTPPass.* with compile range",
+                    log_holder.text,
+                )
+
+                n_expected = tp_size * (num_compile_ranges - num_ranges_activated)
+                assert len(log_matches) == n_expected, (
+                    f'Could not find {n_expected} "Skipping AsyncTPPass" '
                     f"(found {len(log_matches)}) in:\n {log_holder.text}"
                 )
 
