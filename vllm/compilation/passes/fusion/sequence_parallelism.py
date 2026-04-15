@@ -40,6 +40,8 @@ SP_MIN_PER_GPU_SIZE_MB: dict[int, float] = {
     90: 8,  # 8MB per GPU for H100
 }
 
+ASYNC_TP_MIN_TOKENS_PER_RANK = 64
+
 
 def get_sequence_parallelism_threshold(
     hidden_size: int,
@@ -86,7 +88,7 @@ def get_sequence_parallelism_threshold(
 
 
 def get_effective_sp_min_token_num(config: VllmConfig) -> int | None:
-    """Return the effective token threshold shared by SP and AsyncTP.
+    """Return the effective token threshold for SP compile-range gating.
 
     `sp_min_token_num` is additionally capped by `max_num_batched_tokens` so
     the pass never activates outside the scheduler's reachable batch-size
@@ -104,6 +106,21 @@ def get_effective_sp_min_token_num(config: VllmConfig) -> int | None:
         min_token_num = min(min_token_num, max_batched)
 
     return min_token_num
+
+
+def get_effective_async_tp_min_token_num(config: VllmConfig) -> int | None:
+    """Return the effective token threshold for AsyncTP compile-range gating.
+
+    AsyncTP is layered on top of SP, so it inherits the SP threshold and then
+    raises it to a conservative full-token floor derived from the stricter
+    ReduceScatter-side requirement of at least 64 tokens per TP rank.
+    """
+    min_token_num = get_effective_sp_min_token_num(config)
+    if min_token_num is None:
+        return None
+
+    tp_size = config.parallel_config.tensor_parallel_size
+    return max(min_token_num, ASYNC_TP_MIN_TOKENS_PER_RANK * tp_size)
 
 
 def is_sp_applicable_for_range(

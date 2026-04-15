@@ -1613,6 +1613,26 @@ class VllmConfig:
                 # This creates ranges: [1, min-1] (no SP), [min, max] (SP applies)
                 computed_compile_ranges_endpoints.append(min_token_num - 1)
 
+            if pass_config.fuse_gemm_comms:
+                from vllm.compilation.passes.fusion.sequence_parallelism import (
+                    get_effective_async_tp_min_token_num,
+                )
+
+                async_tp_min_token_num = get_effective_async_tp_min_token_num(self)
+                if async_tp_min_token_num is not None and (
+                    min_token_num is not None
+                    and async_tp_min_token_num > min_token_num
+                    and max_num_batched_tokens is not None
+                    and async_tp_min_token_num < max_num_batched_tokens
+                    and async_tp_min_token_num > 1
+                ):
+                    # Add another endpoint so AsyncTP can start later than SP.
+                    # This creates ranges:
+                    # [1, sp_min-1] (no SP),
+                    # [sp_min, async_tp_min-1] (SP only),
+                    # [async_tp_min, max] (SP + AsyncTP).
+                    computed_compile_ranges_endpoints.append(async_tp_min_token_num - 1)
+
         if compilation_config.pass_config.fuse_rope_kvcache:
             max_token_num = (
                 compilation_config.pass_config.rope_kvcache_fusion_max_token_num
