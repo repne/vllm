@@ -1648,6 +1648,7 @@ class VllmConfig:
             if pass_config.fuse_gemm_comms:
                 from vllm.compilation.passes.fusion.sequence_parallelism import (
                     get_effective_async_tp_min_token_num,
+                    get_effective_flashinfer_bmm_fp8_rs_min_token_num,
                 )
 
                 async_tp_min_token_num = get_effective_async_tp_min_token_num(self)
@@ -1664,6 +1665,25 @@ class VllmConfig:
                     # [sp_min, async_tp_min-1] (SP only),
                     # [async_tp_min, max] (SP + AsyncTP).
                     computed_compile_ranges_endpoints.append(async_tp_min_token_num - 1)
+
+                if compilation_config.is_custom_op_enabled("quant_fp8"):
+                    flashinfer_bmm_fp8_rs_min_token_num = (
+                        get_effective_flashinfer_bmm_fp8_rs_min_token_num(self)
+                    )
+                    if flashinfer_bmm_fp8_rs_min_token_num is not None and (
+                        min_token_num is not None
+                        and flashinfer_bmm_fp8_rs_min_token_num > min_token_num
+                        and max_num_batched_tokens is not None
+                        and flashinfer_bmm_fp8_rs_min_token_num
+                        <= max_num_batched_tokens
+                        and flashinfer_bmm_fp8_rs_min_token_num > 1
+                    ):
+                        # FlashInfer bmm_fp8 + RS has a stricter crossover than
+                        # generic AsyncTP. Split the range so only large-M graphs
+                        # lower into that fused custom op.
+                        computed_compile_ranges_endpoints.append(
+                            flashinfer_bmm_fp8_rs_min_token_num - 1
+                        )
 
         if compilation_config.pass_config.fuse_rope_kvcache:
             max_token_num = (

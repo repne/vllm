@@ -41,6 +41,10 @@ SP_MIN_PER_GPU_SIZE_MB: dict[int, float] = {
 }
 
 ASYNC_TP_MIN_TOKENS_PER_RANK = 64
+# PyTorch symm_mem microbench starts to win earlier on TP4, but vLLM
+# end-to-end profiles only show stable gains once the batch reaches 8192.
+FLASHINFER_BMM_FP8_RS_MIN_TOKENS_TP4 = 8192
+FLASHINFER_BMM_FP8_RS_MIN_TOKENS_TP8_PLUS = 4096
 
 
 def get_sequence_parallelism_threshold(
@@ -121,6 +125,30 @@ def get_effective_async_tp_min_token_num(config: VllmConfig) -> int | None:
 
     tp_size = config.parallel_config.tensor_parallel_size
     return max(min_token_num, ASYNC_TP_MIN_TOKENS_PER_RANK * tp_size)
+
+
+def get_effective_flashinfer_bmm_fp8_rs_min_token_num(
+    config: VllmConfig,
+) -> int | None:
+    """Return the token threshold for FlashInfer bmm_fp8 + RS fusion.
+
+    This keeps small-M policy at compile-range granularity, so small ranges
+    keep the unfused graph instead of lowering into the fused custom op.
+    """
+    min_token_num = get_effective_sp_min_token_num(config)
+    if min_token_num is None:
+        return None
+
+    tp_size = config.parallel_config.tensor_parallel_size
+    if tp_size == 2:
+        return None
+
+    if tp_size == 4:
+        min_bmm_fp8_rs_token_num = FLASHINFER_BMM_FP8_RS_MIN_TOKENS_TP4
+    else:
+        min_bmm_fp8_rs_token_num = FLASHINFER_BMM_FP8_RS_MIN_TOKENS_TP8_PLUS
+
+    return max(min_token_num, min_bmm_fp8_rs_token_num)
 
 
 def is_sp_applicable_for_range(

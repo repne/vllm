@@ -25,7 +25,6 @@ If you only need to use the distributed environment without model/pipeline
 
 import contextlib
 import gc
-import math
 import pickle
 import weakref
 from collections import namedtuple
@@ -321,39 +320,6 @@ def _flashinfer_scaled_mm_out(
     )
 
 
-def _should_use_flashinfer_fused_scaled_matmul_reduce_scatter_impl(
-    A: torch.Tensor,
-    A_scale: torch.Tensor,
-    B_scale: torch.Tensor,
-    orig_scatter_dim: int,
-    scatter_dim_after_maybe_reshape: int,
-    group_name: str,
-) -> bool:
-    full_m = math.prod(A.shape[:-1])
-    world_size = _get_fake_collective_world_size(group_name)
-    if world_size == 2:
-        # Empirically, the existing RS impl is not consistently helpful for
-        # TP2 on the async-tp FP8 shapes we care about. Keep TP2 on the
-        # explicit FlashInfer mm + reduce_scatter fallback for now.
-        min_full_m = None
-    elif world_size == 4:
-        min_full_m = 2048
-    else:
-        # TP8 crosses over later in the microbench sweep, and larger TP sizes
-        # should be at least as communication-sensitive.
-        min_full_m = 4096
-    return (
-        A.is_contiguous()
-        and A_scale.numel() == 1
-        and B_scale.numel() == 1
-        and orig_scatter_dim == 0
-        and scatter_dim_after_maybe_reshape == 0
-        and full_m % world_size == 0
-        and min_full_m is not None
-        and full_m >= min_full_m
-    )
-
-
 def fused_flashinfer_scaled_matmul_reduce_scatter_fake(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -388,13 +354,24 @@ def fused_flashinfer_scaled_matmul_reduce_scatter(
     output_shape: list[int],
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    from vllm.utils.flashinfer import flashinfer_scaled_fp8_mm
-
     if orig_scatter_dim != 0 or scatter_dim_after_maybe_reshape != 0:
         raise NotImplementedError(
             "FlashInfer symm_mem adapter currently only supports scatter_dim=0"
         )
     world_size = _get_fake_collective_world_size(group_name)
+    if A.ndim != 2 or B.ndim != 2:
+        raise ValueError("FlashInfer symm_mem adapter expects 2D inputs")
+    if not A.is_contiguous():
+        raise ValueError("FlashInfer symm_mem adapter expects contiguous A")
+    if A_scale.numel() != 1 or B_scale.numel() != 1:
+        raise ValueError(
+            "FlashInfer symm_mem adapter only supports tensor-wise FP8 scales"
+        )
+    if A.shape[0] % world_size != 0:
+        raise ValueError(
+            "FlashInfer symm_mem adapter expects M divisible by world size"
+        )
+
     resolved_group_name = _resolve_symm_mem_group_name(group_name)
     kwargs = {
         "scale_b": B_scale,
@@ -403,25 +380,8 @@ def fused_flashinfer_scaled_matmul_reduce_scatter(
         "out_dtype": out_dtype,
         "use_fast_accum": False,
     }
-    if not _should_use_flashinfer_fused_scaled_matmul_reduce_scatter_impl(
-        A,
-        A_scale,
-        B_scale,
-        orig_scatter_dim,
-        scatter_dim_after_maybe_reshape,
-        group_name,
-    ):
-        out = flashinfer_scaled_fp8_mm(
-            A,
-            B,
-            A_scale,
-            B_scale,
-            out_dtype or torch.bfloat16,
-        )
-        out = reduce_scatter(out, orig_scatter_dim, world_size, group_name)
-        if reduce_op == "avg":
-            out = out / world_size
-        return out
+    # Small-M policy is handled by compile ranges; this op should only lower
+    # into the native fused symm_mem implementation.
     return torch.distributed._symmetric_memory._fused_scaled_matmul_reduce_scatter_impl(
         mm_out_op=_flashinfer_scaled_mm_out,
         A=A,

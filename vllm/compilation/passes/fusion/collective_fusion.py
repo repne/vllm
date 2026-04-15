@@ -18,7 +18,7 @@ from vllm.distributed.parallel_state import (
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
-from ..inductor_pass import enable_fake_mode
+from ..inductor_pass import enable_fake_mode, get_pass_context
 from ..vllm_inductor_pass import (
     VllmFusionPatternMatcherPass,
     VllmInductorPass,
@@ -26,6 +26,7 @@ from ..vllm_inductor_pass import (
 )
 from .sequence_parallelism import (
     get_effective_async_tp_min_token_num,
+    get_effective_flashinfer_bmm_fp8_rs_min_token_num,
     is_sp_applicable_for_range,
 )
 
@@ -504,21 +505,15 @@ class FlashInferAllGatherBMMFP8Pattern(BasePattern):
         )
 
 
-def register_flashinfer_bmm_fp8_collective_patterns(
-    pm_pass: PatternMatcherPass,
-    dtype: torch.dtype,
-    device: str | None,
-) -> None:
-    FlashInferBMMFP8ReduceScatterPattern(dtype, device).register(pm_pass)
-    FlashInferAllGatherBMMFP8Pattern(dtype, device).register(pm_pass)
-
-
 class AsyncTPPass(VllmPatternMatcherPass):
     @enable_fake_mode
     def __init__(self, config: VllmConfig) -> None:
         super().__init__(config)
 
         self.min_token_num = get_effective_async_tp_min_token_num(config)
+        self.flashinfer_bmm_fp8_rs_min_token_num = (
+            get_effective_flashinfer_bmm_fp8_rs_min_token_num(config)
+        )
 
         # Enable symmetric memory for the TP process group
         tp_device_group_name = get_tp_group().device_group.group_name
@@ -526,6 +521,7 @@ class AsyncTPPass(VllmPatternMatcherPass):
         self.patterns: PatternMatcherPass = PatternMatcherPass(
             pass_name="async_tp_pass"
         )
+        self.flashinfer_bmm_fp8_rs_patterns: PatternMatcherPass | None = None
         GEMMReduceScatterPattern(self.model_dtype, self.device).register(self.patterns)
 
         AllGatherGEMMPattern(self.model_dtype, self.device).register(self.patterns)
@@ -550,13 +546,19 @@ class AsyncTPPass(VllmPatternMatcherPass):
             with suppress(ImportError):
                 import vllm.utils.flashinfer  # noqa: F401
             if hasattr(torch.ops.vllm, "bmm_fp8"):
-                register_flashinfer_bmm_fp8_collective_patterns(
-                    self.patterns,
-                    self.model_dtype,
-                    self.device,
+                FlashInferAllGatherBMMFP8Pattern(
+                    self.model_dtype, self.device
+                ).register(self.patterns)
+                self.flashinfer_bmm_fp8_rs_patterns = PatternMatcherPass(
+                    pass_name="async_tp_flashinfer_bmm_fp8_rs_pass"
                 )
+                FlashInferBMMFP8ReduceScatterPattern(
+                    self.model_dtype, self.device
+                ).register(self.flashinfer_bmm_fp8_rs_patterns)
 
         self.dump_patterns(config, self.patterns)
+        if self.flashinfer_bmm_fp8_rs_patterns is not None:
+            self.dump_patterns(config, self.flashinfer_bmm_fp8_rs_patterns)
 
     def is_applicable_for_range(self, compile_range: Range) -> bool:
         # AsyncTP is a follow-up optimization on top of sequence parallelism,
@@ -569,5 +571,22 @@ class AsyncTPPass(VllmPatternMatcherPass):
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
+        compile_range = get_pass_context().compile_range
         self.matched_count = self.patterns.apply(graph)
+        flashinfer_bmm_fp8_rs_patterns = self.flashinfer_bmm_fp8_rs_patterns
+        if flashinfer_bmm_fp8_rs_patterns is None:
+            logger.debug("Replaced %s patterns", self.matched_count)
+            return
+
+        if is_sp_applicable_for_range(
+            self.compilation_config,
+            self.flashinfer_bmm_fp8_rs_min_token_num,
+            compile_range,
+        ):
+            self.matched_count += flashinfer_bmm_fp8_rs_patterns.apply(graph)
+        else:
+            logger.debug(
+                "Skipping FlashInfer bmm_fp8 + RS patterns with compile range %s",
+                compile_range,
+            )
         logger.debug("Replaced %s patterns", self.matched_count)
