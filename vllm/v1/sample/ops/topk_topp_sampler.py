@@ -41,23 +41,35 @@ class TopKTopPSampler(nn.Module):
 
                 capability = current_platform.get_device_capability()
                 assert capability is not None
-                if not FlashInferBackend.supports_compute_capability(capability):
+                if FlashInferBackend.supports_compute_capability(capability):
+                    logger.info_once(
+                        "Using FlashInfer for top-p & top-k sampling.",
+                        scope="global",
+                    )
+                    self.forward = self.forward_cuda
+                elif envs.is_set("VLLM_USE_FLASHINFER_SAMPLER"):
+                    # User explicitly opted in but the GPU can't run FlashInfer.
                     capability_str = capability.as_version_str()
                     raise RuntimeError(
                         "FlashInfer does not support compute capability "
                         f"{capability_str}, unset VLLM_USE_FLASHINFER_SAMPLER=1."
                     )
-                # Users must opt in explicitly via VLLM_USE_FLASHINFER_SAMPLER=1.
-                logger.info_once(
-                    "Using FlashInfer for top-p & top-k sampling.",
-                    scope="global",
-                )
-                self.forward = self.forward_cuda
+                else:
+                    # Default-on path; hardware can't run FlashInfer →
+                    # quietly fall back to the PyTorch-native sampler
+                    # instead of failing server startup.
+                    logger.warning_once(
+                        "FlashInfer top-p/top-k sampling not supported on "
+                        "compute capability %s; falling back to PyTorch-native "
+                        "sampler. Set VLLM_USE_FLASHINFER_SAMPLER=0 to silence.",
+                        capability.as_version_str(),
+                    )
+                    self.forward = self.forward_native
             else:
-                logger.debug_once(
-                    "FlashInfer top-p/top-k sampling is available but disabled "
-                    "by default. Set VLLM_USE_FLASHINFER_SAMPLER=1 to opt in "
-                    "after verifying accuracy for your workloads."
+                # User explicitly set VLLM_USE_FLASHINFER_SAMPLER=0.
+                logger.info_once(
+                    "FlashInfer top-p/top-k sampling disabled via "
+                    "VLLM_USE_FLASHINFER_SAMPLER=0; using PyTorch-native sampler."
                 )
                 self.forward = self.forward_native
 
