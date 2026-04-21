@@ -26,22 +26,6 @@ from .models import (
 pytestmark = pytest.mark.skipif(not current_platform.is_cuda(), reason="Only test CUDA")
 
 
-def _gate_flashinfer_attn_quant_matches(
-    matches: Matches, attn_backend: AttentionBackendCase
-) -> Matches:
-    if attn_backend.backend.name != "FLASHINFER":
-        return matches
-
-    from vllm.utils.flashinfer import supports_trtllm_attention
-
-    if supports_trtllm_attention():
-        return matches
-
-    # Keep FlashInfer AsyncTP coverage on SM103/GB300, but do not expect
-    # attention output quant fusion without TRTLLM attention support.
-    return matches._replace(attn_quant_fusion=0)
-
-
 @multi_gpu_test(num_gpus=2)
 @pytest.mark.parametrize(
     "model_name, matches_fn, model_kwargs, hf_overrides",
@@ -63,7 +47,6 @@ def test_tp2_async_tp_fp8_fusions(
     run_e2e_fusion_test,
 ):
     matches = matches_fn(n_layers)
-    matches = _gate_flashinfer_attn_quant_matches(matches, attn_backend)
 
     # Reduce size of model and skip weight loading time
     model_kwargs["hf_overrides"] = hf_overrides(n_layers)
@@ -186,7 +169,6 @@ def test_tp2_sp_ar_rms_fp8_fusions(
     run_e2e_fusion_test,
 ):
     matches = matches_fn(n_layers)
-    matches = _gate_flashinfer_attn_quant_matches(matches, attn_backend)
 
     # Reduce size of model and skip weight loading time
     model_kwargs["hf_overrides"] = hf_overrides(n_layers)

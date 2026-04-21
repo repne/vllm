@@ -259,17 +259,6 @@ def patched_fused_scaled_matmul_reduce_scatter(
     )
 
 
-def _get_fake_collective_world_size(group_name: str) -> int:
-    group_ref = _groups.get(group_name)
-    if group_ref is not None:
-        group = group_ref()
-        if group is not None:
-            return group.world_size
-    if torch.distributed.is_initialized():
-        return torch.distributed.get_world_size()
-    return 1
-
-
 def _resolve_symm_mem_group_name(group_name: str) -> str:
     group_ref = _groups.get(group_name)
     if group_ref is None:
@@ -278,6 +267,17 @@ def _resolve_symm_mem_group_name(group_name: str) -> str:
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     return getattr(group.device_group, "group_name", group_name)
+
+
+def _get_group_world_size_or_default(group_name: str) -> int:
+    group_ref = _groups.get(group_name)
+    if group_ref is not None:
+        group = group_ref()
+        if group is not None:
+            return group.world_size
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_world_size()
+    return 1
 
 
 def _flashinfer_scaled_mm_out(
@@ -303,12 +303,12 @@ def _flashinfer_scaled_mm_out(
     assert not use_fast_accum, (
         "FlashInfer symm_mem adapter does not support use_fast_accum"
     )
-    if A.ndim != 2 or B.ndim != 2 or out.ndim != 2:
-        raise ValueError("FlashInfer symm_mem adapter expects 2D inputs and output")
-    if scale_a.numel() != 1 or scale_b.numel() != 1:
-        raise ValueError(
-            "FlashInfer symm_mem adapter only supports tensor-wise FP8 scales"
-        )
+    assert A.ndim == 2 and B.ndim == 2 and out.ndim == 2, (
+        "FlashInfer symm_mem adapter expects 2D inputs and output"
+    )
+    assert scale_a.numel() == 1 and scale_b.numel() == 1, (
+        "FlashInfer symm_mem adapter only supports tensor-wise FP8 scales"
+    )
 
     flashinfer_scaled_fp8_mm_out(
         A,
@@ -332,7 +332,7 @@ def fused_flashinfer_scaled_matmul_reduce_scatter_fake(
     output_shape: list[int],
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    world_size = _get_fake_collective_world_size(group_name)
+    world_size = _get_group_world_size_or_default(group_name)
     result_shape = list(output_shape)
     result_shape[orig_scatter_dim] //= world_size
     return torch.empty(
@@ -354,23 +354,18 @@ def fused_flashinfer_scaled_matmul_reduce_scatter(
     output_shape: list[int],
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    if orig_scatter_dim != 0 or scatter_dim_after_maybe_reshape != 0:
-        raise NotImplementedError(
-            "FlashInfer symm_mem adapter currently only supports scatter_dim=0"
-        )
-    world_size = _get_fake_collective_world_size(group_name)
-    if A.ndim != 2 or B.ndim != 2:
-        raise ValueError("FlashInfer symm_mem adapter expects 2D inputs")
-    if not A.is_contiguous():
-        raise ValueError("FlashInfer symm_mem adapter expects contiguous A")
-    if A_scale.numel() != 1 or B_scale.numel() != 1:
-        raise ValueError(
-            "FlashInfer symm_mem adapter only supports tensor-wise FP8 scales"
-        )
-    if A.shape[0] % world_size != 0:
-        raise ValueError(
-            "FlashInfer symm_mem adapter expects M divisible by world size"
-        )
+    assert orig_scatter_dim == 0 and scatter_dim_after_maybe_reshape == 0, (
+        "FlashInfer symm_mem adapter currently only supports scatter_dim=0"
+    )
+    world_size = _get_group_world_size_or_default(group_name)
+    assert A.ndim == 2 and B.ndim == 2, "FlashInfer symm_mem adapter expects 2D inputs"
+    assert A.is_contiguous(), "FlashInfer symm_mem adapter expects contiguous A"
+    assert A_scale.numel() == 1 and B_scale.numel() == 1, (
+        "FlashInfer symm_mem adapter only supports tensor-wise FP8 scales"
+    )
+    assert A.shape[0] % world_size == 0, (
+        "FlashInfer symm_mem adapter expects M divisible by world size"
+    )
 
     resolved_group_name = _resolve_symm_mem_group_name(group_name)
     kwargs = {
@@ -406,7 +401,7 @@ def fused_all_gather_flashinfer_scaled_matmul_fake(
     group_name: str,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    world_size = _get_fake_collective_world_size(group_name)
+    world_size = _get_group_world_size_or_default(group_name)
     output_shape = list(A_shard.shape)
     output_shape[gather_dim] *= world_size
     output_shape[-1] = B.shape[1]
@@ -426,10 +421,9 @@ def fused_all_gather_flashinfer_scaled_matmul(
     group_name: str,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    if gather_dim != 0:
-        raise NotImplementedError(
-            "FlashInfer symm_mem adapter currently only supports gather_dim=0"
-        )
+    assert gather_dim == 0, (
+        "FlashInfer symm_mem adapter currently only supports gather_dim=0"
+    )
     resolved_group_name = _resolve_symm_mem_group_name(group_name)
     _, outputs = torch.distributed._symmetric_memory._fused_all_gather_matmul_impl(
         mm_out_op=_flashinfer_scaled_mm_out,

@@ -97,6 +97,12 @@ def run_e2e_fusion_test(monkeypatch, caplog_mp_spawn):
                 f"attention backend '{attn_backend.backend.name}'"
             )
 
+        if attn_backend.backend.name == "FLASHINFER":
+            from vllm.utils.flashinfer import supports_trtllm_attention
+
+            if not supports_trtllm_attention():
+                matches = matches._replace(attn_quant_fusion=0)
+
         # TODO: remove this after finishing migration from envs to model kwargs
         if model_name == "openai/gpt-oss-20b":
             from .common import is_blackwell
@@ -269,23 +275,6 @@ def run_e2e_fusion_test(monkeypatch, caplog_mp_spawn):
                 n_expected = tp_size * (num_compile_ranges - num_ranges_activated)
                 assert len(log_matches) == n_expected, (
                     f'Could not find {n_expected} "Skipping SequenceParallelismPass" '
-                    f"(found {len(log_matches)}) in:\n {log_holder.text}"
-                )
-
-            if (
-                match_name == "async_tp"
-                and "sequence_parallel" in matches_check
-                and num_compile_ranges >= 2
-            ):
-                log_matches = re.findall(
-                    r"pass_manager.py:\d+] Skipping "
-                    r".*AsyncTPPass.* with compile range",
-                    log_holder.text,
-                )
-
-                n_expected = tp_size * (num_compile_ranges - num_ranges_activated)
-                assert len(log_matches) == n_expected, (
-                    f'Could not find {n_expected} "Skipping AsyncTPPass" '
                     f"(found {len(log_matches)}) in:\n {log_holder.text}"
                 )
 

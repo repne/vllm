@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Callable
 from contextlib import suppress
 
 import torch
@@ -18,16 +19,12 @@ from vllm.distributed.parallel_state import (
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
-from ..inductor_pass import enable_fake_mode, get_pass_context
+from ..inductor_pass import enable_fake_mode
 from ..vllm_inductor_pass import (
     VllmFusionPatternMatcherPass,
     VllmInductorPass,
     VllmPatternMatcherPass,
-)
-from .sequence_parallelism import (
-    get_effective_async_tp_min_token_num,
-    get_effective_flashinfer_bmm_fp8_rs_min_token_num,
-    is_sp_applicable_for_range,
+    VllmPatternReplacement,
 )
 
 FP8_DTYPE = current_platform.fp8_dtype()
@@ -41,6 +38,19 @@ class BasePattern:
         self.device = device
         self.tp = get_tp_group()
         self.tp_size = get_tensor_model_parallel_world_size()
+
+
+def _register_replacement_on_pass(
+    pattern_replacement: VllmPatternReplacement[..., torch.Tensor],
+    pm_pass: PatternMatcherPass,
+) -> None:
+    pm.register_replacement(
+        pattern_replacement.pattern,
+        pattern_replacement.replacement,
+        pattern_replacement.get_inputs(),
+        VllmFusionPatternMatcherPass._trace_fn,
+        pm_pass,
+    )
 
 
 class GEMMReduceScatterPattern(BasePattern):
@@ -382,7 +392,9 @@ class AllGatherCutlassScaledMMPattern(BasePattern):
         )
 
 
-class FlashInferBMMFP8ReduceScatterPattern(BasePattern):
+class FlashInferBMMFP8ReduceScatterPattern(
+    BasePattern, VllmPatternReplacement[..., torch.Tensor]
+):
     def get_inputs(self) -> list[torch.Tensor]:
         a_2d = torch.empty([16, 16], device=self.device, dtype=FP8_DTYPE)
         b_2d = (
@@ -394,8 +406,9 @@ class FlashInferBMMFP8ReduceScatterPattern(BasePattern):
         b_scale = torch.empty([1], device=self.device, dtype=torch.float32)
         return [a_2d, b_2d, a_scale, b_scale]
 
-    def register(self, pm_pass: PatternMatcherPass) -> None:
-        def pattern(
+    @property
+    def pattern(self) -> Callable[..., torch.Tensor]:
+        def _pattern(
             a_2d: torch.Tensor,
             b_2d: torch.Tensor,
             a_scale: torch.Tensor,
@@ -417,7 +430,11 @@ class FlashInferBMMFP8ReduceScatterPattern(BasePattern):
                 group_name=self.tp.unique_name,
             )
 
-        def replacement(
+        return _pattern
+
+    @property
+    def replacement(self) -> Callable[..., torch.Tensor]:
+        def _replacement(
             a_2d: torch.Tensor,
             b_2d: torch.Tensor,
             a_scale: torch.Tensor,
@@ -436,16 +453,12 @@ class FlashInferBMMFP8ReduceScatterPattern(BasePattern):
                 self.dtype,
             )
 
-        pm.register_replacement(
-            pattern,
-            replacement,
-            self.get_inputs(),
-            VllmFusionPatternMatcherPass._trace_fn,
-            pm_pass,
-        )
+        return _replacement
 
 
-class FlashInferAllGatherBMMFP8Pattern(BasePattern):
+class FlashInferAllGatherBMMFP8Pattern(
+    BasePattern, VllmPatternReplacement[..., torch.Tensor]
+):
     def get_inputs(self) -> list[torch.Tensor]:
         a_shard_2d = torch.empty([8, 16], device=self.device, dtype=FP8_DTYPE)
         b_2d = (
@@ -457,8 +470,9 @@ class FlashInferAllGatherBMMFP8Pattern(BasePattern):
         b_scale = torch.empty([1], device=self.device, dtype=torch.float32)
         return [a_shard_2d, b_2d, a_scale, b_scale]
 
-    def register(self, pm_pass: PatternMatcherPass) -> None:
-        def pattern(
+    @property
+    def pattern(self) -> Callable[..., torch.Tensor]:
+        def _pattern(
             a_shard_2d: torch.Tensor,
             b_2d: torch.Tensor,
             a_scale: torch.Tensor,
@@ -479,7 +493,11 @@ class FlashInferAllGatherBMMFP8Pattern(BasePattern):
                 "auto",
             )
 
-        def replacement(
+        return _pattern
+
+    @property
+    def replacement(self) -> Callable[..., torch.Tensor]:
+        def _replacement(
             a_shard_2d: torch.Tensor,
             b_2d: torch.Tensor,
             a_scale: torch.Tensor,
@@ -496,13 +514,7 @@ class FlashInferAllGatherBMMFP8Pattern(BasePattern):
             )
             return torch.ops.aten.unsqueeze.default(fused, 0)
 
-        pm.register_replacement(
-            pattern,
-            replacement,
-            self.get_inputs(),
-            pm.fwd_only,
-            pm_pass,
-        )
+        return _replacement
 
 
 class AsyncTPPass(VllmPatternMatcherPass):
@@ -510,18 +522,12 @@ class AsyncTPPass(VllmPatternMatcherPass):
     def __init__(self, config: VllmConfig) -> None:
         super().__init__(config)
 
-        self.min_token_num = get_effective_async_tp_min_token_num(config)
-        self.flashinfer_bmm_fp8_rs_min_token_num = (
-            get_effective_flashinfer_bmm_fp8_rs_min_token_num(config)
-        )
-
         # Enable symmetric memory for the TP process group
         tp_device_group_name = get_tp_group().device_group.group_name
         enable_symm_mem_for_group(tp_device_group_name)
         self.patterns: PatternMatcherPass = PatternMatcherPass(
             pass_name="async_tp_pass"
         )
-        self.flashinfer_bmm_fp8_rs_patterns: PatternMatcherPass | None = None
         GEMMReduceScatterPattern(self.model_dtype, self.device).register(self.patterns)
 
         AllGatherGEMMPattern(self.model_dtype, self.device).register(self.patterns)
@@ -546,47 +552,23 @@ class AsyncTPPass(VllmPatternMatcherPass):
             with suppress(ImportError):
                 import vllm.utils.flashinfer  # noqa: F401
             if hasattr(torch.ops.vllm, "bmm_fp8"):
-                FlashInferAllGatherBMMFP8Pattern(
-                    self.model_dtype, self.device
-                ).register(self.patterns)
-                self.flashinfer_bmm_fp8_rs_patterns = PatternMatcherPass(
-                    pass_name="async_tp_flashinfer_bmm_fp8_rs_pass"
+                _register_replacement_on_pass(
+                    FlashInferAllGatherBMMFP8Pattern(self.model_dtype, self.device),
+                    self.patterns,
                 )
-                FlashInferBMMFP8ReduceScatterPattern(
-                    self.model_dtype, self.device
-                ).register(self.flashinfer_bmm_fp8_rs_patterns)
+                _register_replacement_on_pass(
+                    FlashInferBMMFP8ReduceScatterPattern(self.model_dtype, self.device),
+                    self.patterns,
+                )
 
         self.dump_patterns(config, self.patterns)
-        if self.flashinfer_bmm_fp8_rs_patterns is not None:
-            self.dump_patterns(config, self.flashinfer_bmm_fp8_rs_patterns)
 
     def is_applicable_for_range(self, compile_range: Range) -> bool:
-        # AsyncTP is a follow-up optimization on top of sequence parallelism,
-        # so reuse the SP-style compile-range gate with an AsyncTP threshold.
-        return is_sp_applicable_for_range(
-            self.compilation_config,
-            self.min_token_num,
-            compile_range,
-        )
+        # AsyncTP patterns are only created after SP rewrites. If SP did not
+        # run for a range there is naturally nothing here to match.
+        return True
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
-        compile_range = get_pass_context().compile_range
         self.matched_count = self.patterns.apply(graph)
-        flashinfer_bmm_fp8_rs_patterns = self.flashinfer_bmm_fp8_rs_patterns
-        if flashinfer_bmm_fp8_rs_patterns is None:
-            logger.debug("Replaced %s patterns", self.matched_count)
-            return
-
-        if is_sp_applicable_for_range(
-            self.compilation_config,
-            self.flashinfer_bmm_fp8_rs_min_token_num,
-            compile_range,
-        ):
-            self.matched_count += flashinfer_bmm_fp8_rs_patterns.apply(graph)
-        else:
-            logger.debug(
-                "Skipping FlashInfer bmm_fp8 + RS patterns with compile range %s",
-                compile_range,
-            )
         logger.debug("Replaced %s patterns", self.matched_count)
