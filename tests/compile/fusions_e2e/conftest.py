@@ -169,7 +169,7 @@ def run_e2e_fusion_test(monkeypatch, caplog_mp_spawn):
                 )
                 num_ranges_activated = len(log_matches) // tp_size
             elif (
-                match_name in ("ar_rms_fusion", "sequence_parallel", "async_tp")
+                match_name in ("ar_rms_fusion", "sequence_parallel")
                 and "sequence_parallel" in matches_check
                 and num_compile_ranges >= 2
             ):
