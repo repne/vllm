@@ -9,6 +9,7 @@ from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
 
 
 def test_flashinfer_fp8_linear_kernel_restores_output_shape(monkeypatch) -> None:
+    """Checks that the FlashInfer kernel restores the caller-provided output shape."""
     expected_shape = (2, 4, 32)
 
     def fake_flashinfer_scaled_fp8_mm(

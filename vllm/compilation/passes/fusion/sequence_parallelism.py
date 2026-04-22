@@ -31,6 +31,7 @@ logger = init_logger(__name__)
 # Only apply sequence parallelism for models with hidden_size >= threshold
 SP_MIN_HIDDEN_SIZE: dict[int, int] = {
     90: 8192,  # H100: only for models with hidden_size >= 8192
+    100: 8192,  # Blackwell family: only for models with hidden_size >= 8192
 }
 
 # Min size per GPU per device capability for sequence parallelism
@@ -38,6 +39,8 @@ SP_MIN_HIDDEN_SIZE: dict[int, int] = {
 # This ensures the threshold scales appropriately with tensor parallelism
 SP_MIN_PER_GPU_SIZE_MB: dict[int, float] = {
     90: 8,  # 8MB per GPU for H100
+    # Use a more conservative threshold on Blackwell so TP8 starts later.
+    100: 32,
 }
 
 
@@ -67,7 +70,12 @@ def get_sequence_parallelism_threshold(
     capability = current_platform.get_device_capability()
     if capability is None:
         return None
-    device_capability = capability.to_int()
+
+    # Collapse Blackwell variants (sm100/sm103/...) into one policy bucket.
+    if current_platform.is_device_capability_family(100):
+        device_capability = 100
+    else:
+        device_capability = capability.to_int()
 
     # Check if device has configured thresholds
     min_hidden_size = SP_MIN_HIDDEN_SIZE.get(device_capability)
@@ -104,28 +112,6 @@ def get_effective_sp_min_token_num(config: VllmConfig) -> int | None:
         min_token_num = min(min_token_num, max_batched)
 
     return min_token_num
-
-
-def is_sp_applicable_for_range(
-    compilation_config,
-    min_token_num: int | None,
-    compile_range: Range,
-) -> bool:
-    """Shared SP-style compile-range gate used by SP and AsyncTP.
-
-    For piecewise compilation, only concrete TP-divisible sizes are eligible.
-    Otherwise the pass activates once the compile range reaches the effective
-    token threshold.
-    """
-    if (
-        not compilation_config.use_inductor_graph_partition
-        and compilation_config.splitting_ops
-    ):
-        tp_size = get_tensor_model_parallel_world_size()
-        if not compile_range.is_single_size() or compile_range.end % tp_size != 0:
-            return False
-
-    return min_token_num is not None and compile_range.start >= min_token_num
 
 
 def get_first_out_wrapper(
@@ -444,10 +430,16 @@ class SequenceParallelismPass(VllmPatternMatcherPass):
 
     def is_applicable_for_range(self, compile_range: Range) -> bool:
         """Determines if sequence parallelism should be applied."""
-        return is_sp_applicable_for_range(
-            self.compilation_config,
-            self.min_token_num,
-            compile_range,
+        if (
+            not self.compilation_config.use_inductor_graph_partition
+            and self.compilation_config.splitting_ops
+        ):
+            tp_size = get_tensor_model_parallel_world_size()
+            if not compile_range.is_single_size() or compile_range.end % tp_size != 0:
+                return False
+
+        return (
+            self.min_token_num is not None and compile_range.start >= self.min_token_num
         )
 
     @VllmInductorPass.time_and_log

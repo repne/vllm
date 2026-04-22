@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-
+import math
 from typing import ClassVar
 
 import torch
@@ -73,9 +73,11 @@ class FlashInferFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         bias: torch.Tensor | None,
         output_shape: list,
     ) -> torch.Tensor:
-        return flashinfer_scaled_fp8_mm(
+        output = flashinfer_scaled_fp8_mm(
             A, B, out_dtype=out_dtype, scale_a=As, scale_b=Bs, bias=bias
         )
+        num_rows = math.prod(output_shape[:-1])
+        return torch.narrow(output, 0, 0, num_rows).view(*output_shape)
 
 
 class FlashInferFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):

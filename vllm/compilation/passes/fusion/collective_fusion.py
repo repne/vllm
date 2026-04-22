@@ -40,19 +40,6 @@ class BasePattern:
         self.tp_size = get_tensor_model_parallel_world_size()
 
 
-def _register_replacement_on_pass(
-    pattern_replacement: VllmPatternReplacement[..., torch.Tensor],
-    pm_pass: PatternMatcherPass,
-) -> None:
-    pm.register_replacement(
-        pattern_replacement.pattern,
-        pattern_replacement.replacement,
-        pattern_replacement.get_inputs(),
-        VllmFusionPatternMatcherPass._trace_fn,
-        pm_pass,
-    )
-
-
 class GEMMReduceScatterPattern(BasePattern):
     def get_inputs(self) -> list[torch.Tensor]:
         mul = torch.empty([16, 4], device=self.device, dtype=self.dtype)
@@ -448,7 +435,7 @@ class FlashInferBMMFP8ReduceScatterPattern(
                 "sum",
                 0,
                 0,
-                self.tp.unique_name,
+                self.tp.device_group.group_name,
                 [a_2d.shape[0], b_2d.shape[1]],
                 self.dtype,
             )
@@ -509,7 +496,7 @@ class FlashInferAllGatherBMMFP8Pattern(
                 a_scale,
                 b_scale,
                 0,
-                self.tp.unique_name,
+                self.tp.device_group.group_name,
                 self.dtype,
             )
             return torch.ops.aten.unsqueeze.default(fused, 0)
@@ -517,58 +504,53 @@ class FlashInferAllGatherBMMFP8Pattern(
         return _replacement
 
 
-class AsyncTPPass(VllmPatternMatcherPass):
+class AsyncTPPass(VllmFusionPatternMatcherPass):
     @enable_fake_mode
     def __init__(self, config: VllmConfig) -> None:
-        super().__init__(config)
+        super().__init__(config, pass_name="async_tp_pass")
 
-        # Enable symmetric memory for the TP process group
-        tp_device_group_name = get_tp_group().device_group.group_name
-        enable_symm_mem_for_group(tp_device_group_name)
-        self.patterns: PatternMatcherPass = PatternMatcherPass(
-            pass_name="async_tp_pass"
-        )
-        GEMMReduceScatterPattern(self.model_dtype, self.device).register(self.patterns)
+        enable_symm_mem_for_group(get_tp_group().device_group.group_name)
+        GEMMReduceScatterPattern(self.model_dtype, self.device).register(self.pm_pass)
 
-        AllGatherGEMMPattern(self.model_dtype, self.device).register(self.patterns)
+        AllGatherGEMMPattern(self.model_dtype, self.device).register(self.pm_pass)
 
         # These fusions are enabled only for bfloat16 models because
         # `scaled_mm` or `cutlass_scaled_mm` with per-token (row-wise) scaling
         # only supports bfloat16 as the output dtype.
         if self.model_dtype == torch.bfloat16:
             ScaledMMReduceScatterPattern(self.model_dtype, self.device).register(
-                self.patterns
+                self.pm_pass
             )
             AllGatherScaledMMPattern(self.model_dtype, self.device).register(
-                self.patterns
+                self.pm_pass
             )
 
             CutlassScaledMMReduceScatterPattern(self.model_dtype, self.device).register(
-                self.patterns
+                self.pm_pass
             )
             AllGatherCutlassScaledMMPattern(self.model_dtype, self.device).register(
-                self.patterns
+                self.pm_pass
             )
             with suppress(ImportError):
                 import vllm.utils.flashinfer  # noqa: F401
             if hasattr(torch.ops.vllm, "bmm_fp8"):
-                _register_replacement_on_pass(
-                    FlashInferAllGatherBMMFP8Pattern(self.model_dtype, self.device),
-                    self.patterns,
+                self.register(
+                    FlashInferAllGatherBMMFP8Pattern(self.model_dtype, self.device)
                 )
-                _register_replacement_on_pass(
-                    FlashInferBMMFP8ReduceScatterPattern(self.model_dtype, self.device),
-                    self.patterns,
+                self.register(
+                    FlashInferBMMFP8ReduceScatterPattern(self.model_dtype, self.device)
                 )
 
-        self.dump_patterns(config, self.patterns)
+        self.dump_patterns(config, self.pm_pass)
 
     def is_applicable_for_range(self, compile_range: Range) -> bool:
         # AsyncTP patterns are only created after SP rewrites. If SP did not
         # run for a range there is naturally nothing here to match.
+        del compile_range
         return True
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
-        self.matched_count = self.patterns.apply(graph)
+        self.matched_count = self.pm_pass.apply(graph)
+        VllmPatternMatcherPass.match_table[self.pass_name] += self.matched_count
         logger.debug("Replaced %s patterns", self.matched_count)

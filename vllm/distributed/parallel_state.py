@@ -40,6 +40,7 @@ import torch
 import torch.distributed
 import torch.distributed._functional_collectives as funcol
 import torch.distributed._symmetric_memory
+import torch.distributed.distributed_c10d as c10d
 from torch.distributed import Backend, ProcessGroup, Store
 
 import vllm.envs as envs
@@ -259,27 +260,6 @@ def patched_fused_scaled_matmul_reduce_scatter(
     )
 
 
-def _resolve_symm_mem_group_name(group_name: str) -> str:
-    group_ref = _groups.get(group_name)
-    if group_ref is None:
-        return group_name
-    group = group_ref()
-    if group is None:
-        raise ValueError(f"Group {group_name} is destroyed.")
-    return getattr(group.device_group, "group_name", group_name)
-
-
-def _get_group_world_size_or_default(group_name: str) -> int:
-    group_ref = _groups.get(group_name)
-    if group_ref is not None:
-        group = group_ref()
-        if group is not None:
-            return group.world_size
-    if torch.distributed.is_initialized():
-        return torch.distributed.get_world_size()
-    return 1
-
-
 def _flashinfer_scaled_mm_out(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -332,7 +312,7 @@ def fused_flashinfer_scaled_matmul_reduce_scatter_fake(
     output_shape: list[int],
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    world_size = _get_group_world_size_or_default(group_name)
+    world_size = c10d._resolve_process_group(group_name).size()
     result_shape = list(output_shape)
     result_shape[orig_scatter_dim] //= world_size
     return torch.empty(
@@ -357,7 +337,7 @@ def fused_flashinfer_scaled_matmul_reduce_scatter(
     assert orig_scatter_dim == 0 and scatter_dim_after_maybe_reshape == 0, (
         "FlashInfer symm_mem adapter currently only supports scatter_dim=0"
     )
-    world_size = _get_group_world_size_or_default(group_name)
+    world_size = c10d._resolve_process_group(group_name).size()
     assert A.ndim == 2 and B.ndim == 2, "FlashInfer symm_mem adapter expects 2D inputs"
     assert A.is_contiguous(), "FlashInfer symm_mem adapter expects contiguous A"
     assert A_scale.numel() == 1 and B_scale.numel() == 1, (
@@ -367,7 +347,6 @@ def fused_flashinfer_scaled_matmul_reduce_scatter(
         "FlashInfer symm_mem adapter expects M divisible by world size"
     )
 
-    resolved_group_name = _resolve_symm_mem_group_name(group_name)
     kwargs = {
         "scale_b": B_scale,
         "bias": None,
@@ -375,8 +354,6 @@ def fused_flashinfer_scaled_matmul_reduce_scatter(
         "out_dtype": out_dtype,
         "use_fast_accum": False,
     }
-    # Small-M policy is handled by compile ranges; this op should only lower
-    # into the native fused symm_mem implementation.
     return torch.distributed._symmetric_memory._fused_scaled_matmul_reduce_scatter_impl(
         mm_out_op=_flashinfer_scaled_mm_out,
         A=A,
@@ -387,7 +364,7 @@ def fused_flashinfer_scaled_matmul_reduce_scatter(
         reduce_op=reduce_op,
         orig_scatter_dim=orig_scatter_dim,
         scatter_dim_after_maybe_reshape=scatter_dim_after_maybe_reshape,
-        group_name=resolved_group_name,
+        group_name=group_name,
         output_shape=output_shape,
     )
 
@@ -401,7 +378,7 @@ def fused_all_gather_flashinfer_scaled_matmul_fake(
     group_name: str,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    world_size = _get_group_world_size_or_default(group_name)
+    world_size = c10d._resolve_process_group(group_name).size()
     output_shape = list(A_shard.shape)
     output_shape[gather_dim] *= world_size
     output_shape[-1] = B.shape[1]
@@ -424,7 +401,6 @@ def fused_all_gather_flashinfer_scaled_matmul(
     assert gather_dim == 0, (
         "FlashInfer symm_mem adapter currently only supports gather_dim=0"
     )
-    resolved_group_name = _resolve_symm_mem_group_name(group_name)
     _, outputs = torch.distributed._symmetric_memory._fused_all_gather_matmul_impl(
         mm_out_op=_flashinfer_scaled_mm_out,
         A_shard=A_shard,
@@ -441,7 +417,7 @@ def fused_all_gather_flashinfer_scaled_matmul(
         ],
         out_dtypes=[out_dtype],
         gather_dim=gather_dim,
-        group_name=resolved_group_name,
+        group_name=group_name,
         return_A=False,
     )
     return outputs[0]

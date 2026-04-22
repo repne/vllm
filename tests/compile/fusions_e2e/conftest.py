@@ -208,7 +208,7 @@ def run_e2e_fusion_test(monkeypatch, caplog_mp_spawn):
                 and "sequence_parallel" in matches_check
                 and num_compile_ranges >= 2
             ):
-                # AsyncTP only runs on ranges where SP ran.
+                # AsyncTP only finds patterns on ranges where SP ran.
                 n_sp_ranges = num_compile_ranges - 1
                 assert (
                     sum(m == expected_matches for m in log_matches)
@@ -217,6 +217,10 @@ def run_e2e_fusion_test(monkeypatch, caplog_mp_spawn):
                     f"Expecting {expected_matches} async_tp on "
                     f"{tp_size * n_sp_ranges} SP-range entries, "
                     f"found: {log_matches}"
+                )
+                assert sum(m == 0 for m in log_matches) == tp_size, (
+                    f"Expecting 0 async_tp on {tp_size} small-range entries "
+                    f"(no SP), found: {log_matches}"
                 )
             elif (
                 match_name == "ar_rms_fusion"
