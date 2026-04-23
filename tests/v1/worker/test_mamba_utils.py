@@ -841,8 +841,8 @@ class TestPostprocessMambaFusedKernel:
         self, device, test_config
     ):
         """
-        Test the early-return optimization in postprocess_mamba_fused_kernel
-        (mamba_utils.py lines 128-134) matches Python behavior.
+        Test the ``src_addr == dst_addr`` early-return path in
+        postprocess_mamba_fused_kernel matches Python behavior.
 
         When src_addr == dst_addr (source and destination memory addresses are
         identical), both implementations should:
@@ -853,11 +853,11 @@ class TestPostprocessMambaFusedKernel:
         - src_block_idx == dest_block_idx (same logical block)
         - accept_token_bias == 0 (no offset within the block)
 
-        Python reference (collect_mamba_copy_meta line 468):
+        Python reference (collect_mamba_copy_meta):
             if src_block_idx == dest_block_idx and accept_token_bias == 0:
                 return  # No copy added
 
-        Python reference (postprocess_mamba lines 644-645):
+        Python reference (postprocess_mamba):
             if src_block_idx == dest_block_idx:
                 num_accepted_tokens_cpu[i] = 1
 
@@ -1018,15 +1018,15 @@ class TestPostprocessMambaFusedKernel:
         self, device, test_config
     ):
         """
-        Test the post-copy num_accepted_tokens update in postprocess_mamba_fused_kernel
-        (mamba_utils.py lines 145-150) matches Python behavior.
+        Test the ``src_block_idx == dest_block_idx`` post-copy update in
+        postprocess_mamba_fused_kernel matches Python behavior.
 
         When src_block_idx == dest_block_idx but accept_token_bias > 0, both
         implementations should:
         1. Perform the copy (src_addr != dst_addr due to offset)
         2. Set num_accepted_tokens to 1 AFTER the copy
 
-        Python reference (postprocess_mamba lines 644-645):
+        Python reference (postprocess_mamba):
             if src_block_idx == dest_block_idx:
                 num_accepted_tokens_cpu[i] = 1
 
@@ -1200,23 +1200,18 @@ class TestPostprocessMambaFusedKernel:
         self, device, test_config
     ):
         """
-        Test that neither snippet triggers when src_block_idx != dest_block_idx,
-        and GPU matches Python behavior.
+        Test that neither special-case path triggers when
+        src_block_idx != dest_block_idx, and GPU matches Python behavior.
 
         When copying between different blocks:
         1. src_addr != dst_addr (different blocks = different addresses)
         2. src_block_idx != dest_block_idx
 
         Therefore:
-        - First snippet (lines 128-134) does NOT trigger:
-            src_addr != dst_addr
-        - Second snippet (lines 145-150) does NOT trigger:
-            src_block_idx != dest_block_idx
+        - The ``src_addr == dst_addr`` early-return does NOT trigger
+        - The ``src_block_idx == dest_block_idx`` post-copy update does NOT trigger
         - Copy happens normally
         - num_accepted_tokens remains UNCHANGED
-
-        Python reference: The condition at line 644 is False, so num_accepted_tokens
-        is not modified.
 
         Test setup (block_size=16):
         - num_tokens_running_state = 60 + 3 - 0 = 63
