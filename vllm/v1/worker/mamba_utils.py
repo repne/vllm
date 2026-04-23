@@ -66,7 +66,7 @@ def postprocess_mamba_fused_kernel(
     if req_idx >= num_reqs:
         return
 
-    # Compute decision logic (same as postprocess_mamba_decision_kernel)
+    # Compute decision logic (mirrors postprocess_mamba Python reference)
     num_accepted = tl.load(num_accepted_tokens_ptr + req_idx)
     src_block_idx = tl.load(mamba_state_idx_ptr + req_idx)
     num_scheduled = tl.load(num_scheduled_tokens_ptr + req_idx)
