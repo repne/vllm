@@ -9,6 +9,8 @@ import torch
 from vllm.config import CacheConfig
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
+    get_conv_copy_spec,
+    get_temporal_copy_spec,
 )
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
@@ -373,11 +375,12 @@ class MambaGPUContext:
                     # Element size
                     self.state_elem_sizes[idx] = state.element_size()
 
-                    # Conv width and inner size: detect conv vs temporal state
-                    # by function name (Conv: get_conv_copy_spec, Temporal:
-                    # get_temporal_copy_spec)
                     copy_func = mamba_state_copy_funcs[state_type_idx]
-                    if "conv" in copy_func.__name__.lower():
+                    assert (
+                        copy_func is get_conv_copy_spec
+                        or copy_func is get_temporal_copy_spec
+                    ), f"unexpected copy func: {copy_func}"
+                    if copy_func is get_conv_copy_spec:
                         # Conv state: conv_width is state.size(1)
                         # inner_size is stride(1) = elements per conv position,
                         # used to compute byte offset for state[block, offset:]
