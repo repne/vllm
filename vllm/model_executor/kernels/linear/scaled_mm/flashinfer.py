@@ -76,6 +76,8 @@ class FlashInferFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         output = flashinfer_scaled_fp8_mm(
             A, B, out_dtype=out_dtype, scale_a=As, scale_b=Bs, bias=bias
         )
+        # FlashInfer returns flattened rows; restore the logical output shape
+        # expected by the linear layer, dropping any padded rows first.
         num_rows = math.prod(output_shape[:-1])
         return torch.narrow(output, 0, 0, num_rows).view(*output_shape)
 

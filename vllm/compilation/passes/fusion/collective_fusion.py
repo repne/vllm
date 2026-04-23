@@ -546,7 +546,6 @@ class AsyncTPPass(VllmFusionPatternMatcherPass):
     def is_applicable_for_range(self, compile_range: Range) -> bool:
         # AsyncTP patterns are only created after SP rewrites. If SP did not
         # run for a range there is naturally nothing here to match.
-        del compile_range
         return True
 
     @VllmInductorPass.time_and_log
