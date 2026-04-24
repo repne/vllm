@@ -132,9 +132,9 @@ class TopKTopPSampler(nn.Module):
         p: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """More optimized implementation for top-k and top-p sampling."""
-        # We prefer `random_sample` over `flashinfer_sample` when sorting is
-        # not needed. This is because `random_sample` does not require
-        # CPU-GPU synchronization while `flashinfer_sample` does.
+        # Fall back to the PyTorch-native path when FlashInfer has nothing
+        # to do (no top-k / top-p filter) or when per-request generators
+        # are present (unsupported by FlashInfer 0.2.3+).
         if (k is None and p is None) or generators:
             if generators:
                 logger.debug_once(
@@ -373,10 +373,6 @@ def flashinfer_sample(
     NOTE: The outputs of this function do not necessarily match the outputs of
     the `random_sample` function. It only guarantees that the outputs are
     statistically equivalent.
-
-    NOTE: This function includes CPU-GPU synchronization, while `random_sample`
-    does not. Call this function at the end of the forward pass to minimize
-    the synchronization overhead.
     """
     import flashinfer
 
