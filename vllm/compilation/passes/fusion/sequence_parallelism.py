@@ -370,22 +370,18 @@ class SequenceParallelismPass(VllmPatternMatcherPass):
     significantly reduce communication overhead and improve overall model
     performance.
 
+    This pass is only supported when compiling the whole graph (fullgraph
+    mode, i.e. using Inductor graph partition or empty splitting_ops).
+    Piecewise compilation is not supported because the residual tensor
+    gets split across TP ranks, causing size mismatches at subgraph
+    boundaries.
 
-    This pass splits up the residual tensor across TP ranks and hence divides its size.
-    Because the pattern matcher starts at the end of the graph, the replacement
-    contains a slice that temporarily conforms the input residual to the correct size.
-    After all patterns have been matched, we use a NoOpEliminationPass to clean up
-    what have now become no-op slices.
-
-    Note that an older version of the pass did not need this as it operated only on
-    custom rms_norm and fused_rms_norm_add custom ops which did not complain about
-    mismatched shapes during replacement. So this approach has the same assumption that
-    correctness is only maintained if all rms_norm operations are split across ranks.
-
-    Correctness-wise, this is approach strictly better than before - before,
-    the graph was incorrect semantically and shape-wise during the pass.
-    With this approach there's only semantic incorrectness during the pass.
-    Both approaches restore a correct graph once all patterns are matched.
+    This pass splits up the residual tensor across TP ranks and hence
+    divides its size. Because the pattern matcher starts at the end of
+    the graph, the replacement contains a slice that temporarily conforms
+    the input residual to the correct size. After all patterns have been
+    matched, we use a NoOpEliminationPass to clean up what have now
+    become no-op slices.
     """
 
     @enable_fake_mode
