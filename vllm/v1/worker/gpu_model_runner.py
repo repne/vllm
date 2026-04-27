@@ -3370,22 +3370,48 @@ class GPUModelRunner(
         if total_num_draft_tokens == 0:
             return None
 
+        prev_positions = self.prev_positions.np[: len(num_draft_tokens)]
+        stable_positions = np.array_equal(
+            prev_positions, np.arange(len(num_draft_tokens))
+        )
+
         if draft_probs.ndim == 2:
+            if not stable_positions:
+                max_spec_len = self.num_spec_tokens
+                packed_probs = []
+                for prev_pos, num_tokens in zip(prev_positions, num_draft_tokens):
+                    if num_tokens == 0:
+                        continue
+                    if prev_pos < 0:
+                        raise RuntimeError(
+                            "Spec decode metadata references draft tokens for a "
+                            "request without a previous batch position."
+                        )
+                    start = prev_pos * max_spec_len
+                    packed_probs.append(draft_probs[start : start + num_tokens])
+                if not packed_probs:
+                    return None
+                return torch.cat(packed_probs, dim=0).contiguous()
             return draft_probs[:total_num_draft_tokens].contiguous()
 
         max_spec_len = draft_probs.shape[1]
-        if all(n == max_spec_len for n in num_draft_tokens):
+        if stable_positions and all(n == max_spec_len for n in num_draft_tokens):
             return (
                 draft_probs[: len(num_draft_tokens)]
                 .reshape(-1, draft_probs.shape[-1])[:total_num_draft_tokens]
                 .contiguous()
             )
 
-        packed_probs = [
-            draft_probs[req_idx, :num_tokens]
-            for req_idx, num_tokens in enumerate(num_draft_tokens)
-            if num_tokens > 0
-        ]
+        packed_probs = []
+        for prev_pos, num_tokens in zip(prev_positions, num_draft_tokens):
+            if num_tokens == 0:
+                continue
+            if prev_pos < 0:
+                raise RuntimeError(
+                    "Spec decode metadata references draft tokens for a "
+                    "request without a previous batch position."
+                )
+            packed_probs.append(draft_probs[prev_pos, :num_tokens])
         if not packed_probs:
             return None
         return torch.cat(packed_probs, dim=0).contiguous()
