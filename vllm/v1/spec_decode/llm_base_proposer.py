@@ -112,6 +112,7 @@ class SpecDecodeBaseProposer:
         self.use_local_argmax_reduction: bool = (
             self.speculative_config.use_local_argmax_reduction
         )
+        self.draft_probs: torch.Tensor | None = None
 
         self.max_batch_size = vllm_config.scheduler_config.max_num_seqs
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -410,6 +411,17 @@ class SpecDecodeBaseProposer:
             return self.model.get_top_tokens(hidden_states)
         return self.model.compute_logits(hidden_states).argmax(dim=-1)
 
+    def _sample_draft_token_ids(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if sampling_metadata.all_greedy:
+            return self._greedy_sample(hidden_states), None
+
+        logits = self.model.compute_logits(hidden_states)
+        return compute_probs_and_sample_next_token(logits, sampling_metadata)
+
     def propose(
         self,
         # [num_tokens]
@@ -429,6 +441,7 @@ class SpecDecodeBaseProposer:
         | list[dict[str, torch.Tensor]]
         | None = None,
     ) -> torch.Tensor:
+        self.draft_probs = None
         batch_size = common_attn_metadata.batch_size()
 
         if self.method in ("eagle3", "dflash"):
@@ -490,7 +503,16 @@ class SpecDecodeBaseProposer:
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
-            draft_token_ids = self._greedy_sample(sample_hidden_states)
+            if self.parallel_drafting and not sampling_metadata.all_greedy:
+                draft_token_ids = self._greedy_sample(sample_hidden_states)
+            else:
+                draft_token_ids, draft_probs = self._sample_draft_token_ids(
+                    sample_hidden_states, sampling_metadata
+                )
+                if draft_probs is not None:
+                    self.draft_probs = draft_probs.view(
+                        -1, self.num_speculative_tokens, draft_probs.shape[-1]
+                    )
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self.uses_mrope:
@@ -513,7 +535,9 @@ class SpecDecodeBaseProposer:
             # [batch_size, num_tree_tokens]
             return torch.cat(draft_token_ids_list, dim=1)
 
-        draft_token_ids = self._greedy_sample(sample_hidden_states)
+        draft_token_ids, draft_probs = self._sample_draft_token_ids(
+            sample_hidden_states, sampling_metadata
+        )
 
         if self.allowed_attn_types is not None:
             for group_md in per_group_attn_metadata:
@@ -527,6 +551,7 @@ class SpecDecodeBaseProposer:
 
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
+        draft_probs_list = [] if draft_probs is None else [draft_probs]
 
         cudagraph_runtime_mode, input_batch_size, batch_size_across_dp = (
             self._determine_batch_execution_and_padding(batch_size)
@@ -647,11 +672,17 @@ class SpecDecodeBaseProposer:
                     last_hidden_states, hidden_states = ret_hidden_states
 
             hidden_states = hidden_states[:batch_size]
-            draft_token_ids = self._greedy_sample(last_hidden_states[:batch_size])
+            draft_token_ids, draft_probs = self._sample_draft_token_ids(
+                last_hidden_states[:batch_size], sampling_metadata
+            )
             draft_token_ids_list.append(draft_token_ids)
+            if draft_probs is not None:
+                draft_probs_list.append(draft_probs)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+        if draft_probs_list:
+            self.draft_probs = torch.stack(draft_probs_list, dim=1)
         return draft_token_ids
 
     def set_inputs_first_pass(
