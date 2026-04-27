@@ -3,6 +3,7 @@
 
 from unittest import mock
 
+import numpy as np
 import pytest
 import torch
 
@@ -426,9 +427,29 @@ def test_gpu_runner_packs_mtp_draft_probs_for_rejection_sampler():
     )
     runner_stub = mock.MagicMock()
     runner_stub._draft_probs = draft_probs
+    runner_stub.prev_positions.np = np.arange(3)
 
     packed = GPUModelRunner._get_draft_probs_for_rejection(runner_stub, metadata)
 
     expected = torch.cat([draft_probs[0, :2], draft_probs[2, :1]], dim=0)
+    assert torch.equal(packed, expected)
+    assert packed.is_contiguous()
+
+
+def test_gpu_runner_packs_mtp_draft_probs_after_batch_reorder():
+    vocab_size = 5
+    draft_probs = torch.arange(
+        3 * 2 * vocab_size, dtype=torch.float32, device=DEVICE_TYPE
+    ).view(3, 2, vocab_size)
+    metadata = SpecDecodeMetadata.make_dummy(
+        draft_token_ids=[[1], [2, 3], []], device=torch.device(DEVICE_TYPE)
+    )
+    runner_stub = mock.MagicMock()
+    runner_stub._draft_probs = draft_probs
+    runner_stub.prev_positions.np = np.array([2, 0, 1])
+
+    packed = GPUModelRunner._get_draft_probs_for_rejection(runner_stub, metadata)
+
+    expected = torch.cat([draft_probs[2, :1], draft_probs[0, :2]], dim=0)
     assert torch.equal(packed, expected)
     assert packed.is_contiguous()
