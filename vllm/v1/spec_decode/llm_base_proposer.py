@@ -37,6 +37,7 @@ from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.sampler import _SAMPLING_EPS
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import (
@@ -503,16 +504,13 @@ class SpecDecodeBaseProposer:
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
-            if self.parallel_drafting and not sampling_metadata.all_greedy:
-                draft_token_ids = self._greedy_sample(sample_hidden_states)
-            else:
-                draft_token_ids, draft_probs = self._sample_draft_token_ids(
-                    sample_hidden_states, sampling_metadata
+            draft_token_ids, draft_probs = self._sample_draft_token_ids(
+                sample_hidden_states, sampling_metadata
+            )
+            if draft_probs is not None:
+                self.draft_probs = draft_probs.view(
+                    -1, self.num_speculative_tokens, draft_probs.shape[-1]
                 )
-                if draft_probs is not None:
-                    self.draft_probs = draft_probs.view(
-                        -1, self.num_speculative_tokens, draft_probs.shape[-1]
-                    )
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self.uses_mrope:
@@ -1816,22 +1814,31 @@ def compute_probs_and_sample_next_token(
 
     # Use epsilon comparison to detect greedy sampling (temperature ~ 0.0)
     # consistent with sampler.py's _SAMPLING_EPS threshold
-    temperature = sampling_metadata.temperature
+    num_tokens = logits.shape[0]
+    temperature = _expand_draft_sampling_tensor(
+        sampling_metadata.temperature,
+        num_tokens,
+    )
     # Avoid division by zero if there are greedy requests.
     if not sampling_metadata.all_random:
         is_greedy = temperature < _SAMPLING_EPS
         temperature = torch.where(is_greedy, 1.0, temperature)
     logits.div_(temperature.view(-1, 1))
+    top_k = _expand_draft_sampling_tensor(sampling_metadata.top_k, num_tokens)
+    top_p = _expand_draft_sampling_tensor(sampling_metadata.top_p, num_tokens)
+    logits = apply_top_k_top_p(logits, top_k, top_p)
     probs = logits.softmax(dim=-1, dtype=torch.float32)
 
-    # NOTE(woosuk): Currently, we ignore most of the sampling parameters in
-    # generating the draft tokens. We only use the temperature. While this
-    # could degrade the acceptance rate, it does not affect the distribution
-    # of the generated tokens after rejection sampling.
-
-    # TODO(woosuk): Consider seeds.
+    generators = _expand_draft_sampling_generators(
+        sampling_metadata.generators,
+        sampling_metadata.temperature.shape[0],
+        num_tokens,
+    )
     q = torch.empty_like(probs)
-    q.exponential_()
+    if len(generators) != num_tokens:
+        q.exponential_()
+    for i, generator in generators.items():
+        q[i].exponential_(generator=generator)
     # NOTE(woosuk): We shouldn't use `probs.div_(q)` because the draft_probs
     # will be used later for rejection sampling.
     next_token_ids = probs.div(q).argmax(dim=-1).view(-1)
@@ -1839,3 +1846,41 @@ def compute_probs_and_sample_next_token(
         greedy_token_ids = probs.argmax(dim=-1)
         next_token_ids = torch.where(is_greedy, greedy_token_ids, next_token_ids)
     return next_token_ids, probs
+
+
+def _expand_draft_sampling_tensor(
+    tensor: torch.Tensor | None,
+    num_tokens: int,
+) -> torch.Tensor | None:
+    if tensor is None or tensor.shape[0] == num_tokens:
+        return tensor
+
+    batch_size = tensor.shape[0]
+    if num_tokens % batch_size != 0:
+        raise ValueError(
+            "Draft sampling metadata must either match the draft logits row "
+            "count or evenly divide it."
+        )
+    return tensor.repeat_interleave(num_tokens // batch_size, dim=0)
+
+
+def _expand_draft_sampling_generators(
+    generators: dict[int, torch.Generator],
+    batch_size: int,
+    num_tokens: int,
+) -> dict[int, torch.Generator]:
+    if not generators or batch_size == num_tokens:
+        return generators
+
+    if num_tokens % batch_size != 0:
+        raise ValueError(
+            "Draft sampling generators must either match the draft logits row "
+            "count or evenly divide it."
+        )
+
+    repeat = num_tokens // batch_size
+    return {
+        req_idx * repeat + offset: generator
+        for req_idx, generator in generators.items()
+        for offset in range(repeat)
+    }

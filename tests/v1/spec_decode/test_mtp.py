@@ -28,6 +28,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.spec_decode.llm_base_proposer import compute_probs_and_sample_next_token
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -35,7 +36,12 @@ mimo_7b_dir = "XiaomiMiMo/MiMo-7B-Base"
 DEVICE_TYPE = current_platform.device_type
 
 
-def _create_sampling_metadata(all_greedy: bool, batch_size: int) -> SamplingMetadata:
+def _create_sampling_metadata(
+    all_greedy: bool,
+    batch_size: int,
+    top_k: torch.Tensor | None = None,
+    top_p: torch.Tensor | None = None,
+) -> SamplingMetadata:
     temperature = None
     if not all_greedy:
         temperature = torch.ones(batch_size, dtype=torch.float32, device=DEVICE_TYPE)
@@ -43,8 +49,8 @@ def _create_sampling_metadata(all_greedy: bool, batch_size: int) -> SamplingMeta
         temperature=temperature,
         all_greedy=all_greedy,
         all_random=not all_greedy,
-        top_p=None,
-        top_k=None,
+        top_p=top_p,
+        top_k=top_k,
         generators={},
         max_num_logprobs=None,
         no_penalties=True,
@@ -60,7 +66,10 @@ def _create_sampling_metadata(all_greedy: bool, batch_size: int) -> SamplingMeta
     )
 
 
-def _create_mtp_proposer(num_speculative_tokens: int) -> EagleProposer:
+def _create_mtp_proposer(
+    num_speculative_tokens: int,
+    parallel_drafting: bool = False,
+) -> EagleProposer:
     """Create an MTP proposer with unified model configuration."""
     model_config = ModelConfig(
         model=mimo_7b_dir, runner="generate", max_model_len=100, trust_remote_code=True
@@ -72,7 +81,10 @@ def _create_mtp_proposer(num_speculative_tokens: int) -> EagleProposer:
         model=mimo_7b_dir,
         method="mtp",
         num_speculative_tokens=num_speculative_tokens,
+        parallel_drafting=parallel_drafting,
     )
+    if parallel_drafting:
+        speculative_config.draft_model_config.hf_config.ptd_token_id = 0
 
     vllm_config = VllmConfig(
         model_config=model_config,
@@ -304,6 +316,104 @@ def test_mtp_propose_random_sampling_records_draft_probs():
     assert proposer.draft_probs.shape == (batch_size, 1, vocab_size)
     expected_probs = torch.softmax(logits, dim=-1).view(batch_size, 1, vocab_size)
     assert torch.allclose(proposer.draft_probs, expected_probs)
+
+
+def test_mtp_draft_sampling_applies_top_k_to_draft_probs():
+    logits = torch.tensor([[0.0, 1.0, 2.0, 3.0]], device=DEVICE_TYPE)
+    top_k = torch.tensor([2], dtype=torch.int32, device=DEVICE_TYPE)
+
+    _token_ids, draft_probs = compute_probs_and_sample_next_token(
+        logits,
+        _create_sampling_metadata(all_greedy=False, batch_size=1, top_k=top_k),
+    )
+
+    expected_logits = torch.tensor(
+        [[-float("inf"), -float("inf"), 2.0, 3.0]], device=DEVICE_TYPE
+    )
+    expected_probs = torch.softmax(expected_logits, dim=-1, dtype=torch.float32)
+    assert torch.allclose(draft_probs, expected_probs)
+
+
+def test_mtp_parallel_drafting_random_sampling_records_draft_probs():
+    device = torch.device(DEVICE_TYPE)
+    batch_size = 2
+    num_spec_tokens = 2
+    seq_lens = [2, 2]
+    total_tokens = sum(seq_lens)
+    vocab_size = 4
+
+    proposer = _create_mtp_proposer(
+        num_speculative_tokens=num_spec_tokens,
+        parallel_drafting=True,
+    )
+    proposer.block_size = 16
+    hidden_size = proposer.hidden_size
+
+    model_mock = mock.MagicMock()
+    model_mock.return_value = torch.zeros(
+        total_tokens + batch_size,
+        hidden_size,
+        dtype=proposer.dtype,
+        device=device,
+    )
+    logits = torch.tensor(
+        [
+            [0.0, 1.0, 2.0, 3.0],
+            [3.0, 2.0, 1.0, 0.0],
+            [0.0, 0.5, 1.0, 1.5],
+            [1.5, 1.0, 0.5, 0.0],
+        ],
+        device=device,
+    )
+    model_mock.compute_logits.return_value = logits.clone()
+    proposer.model = model_mock
+    proposer._draft_attn_layer_names = {"layer.0"}
+
+    batch_spec = BatchSpec(seq_lens=seq_lens, query_lens=seq_lens)
+    common_attn_metadata = create_common_attn_metadata(
+        batch_spec, block_size=16, device=device
+    )
+    attn_metadata_builder_cls, _ = try_get_attention_backend(
+        AttentionBackendEnum.FLASH_ATTN
+    )
+    attn_metadata_builder = attn_metadata_builder_cls(
+        kv_cache_spec=create_standard_kv_cache_spec(proposer.vllm_config),
+        layer_names=list(proposer._draft_attn_layer_names),
+        vllm_config=proposer.vllm_config,
+        device=device,
+    )
+    mock_attn_group = mock.MagicMock()
+    mock_attn_group.get_metadata_builder.return_value = attn_metadata_builder
+    mock_attn_group.layer_names = list(proposer._draft_attn_layer_names)
+    mock_attn_group.kv_cache_spec = attn_metadata_builder.kv_cache_spec
+    proposer.draft_attn_groups = [mock_attn_group]
+
+    result = proposer.propose(
+        target_token_ids=torch.randint(0, vocab_size, (total_tokens,), device=device),
+        target_positions=torch.arange(total_tokens, device=device),
+        target_hidden_states=torch.randn(
+            total_tokens,
+            hidden_size,
+            dtype=proposer.dtype,
+            device=device,
+        ),
+        next_token_ids=torch.randint(
+            0, vocab_size, (batch_size,), dtype=torch.int32, device=device
+        ),
+        token_indices_to_sample=None,
+        common_attn_metadata=common_attn_metadata,
+        sampling_metadata=_create_sampling_metadata(
+            all_greedy=False, batch_size=batch_size
+        ),
+    )
+
+    assert result.shape == (batch_size, num_spec_tokens)
+    assert proposer.draft_probs is not None
+    assert proposer.draft_probs.shape == (batch_size, num_spec_tokens, vocab_size)
+    assert torch.allclose(
+        proposer.draft_probs,
+        torch.softmax(logits, dim=-1).view(batch_size, num_spec_tokens, vocab_size),
+    )
 
 
 def test_gpu_runner_packs_mtp_draft_probs_for_rejection_sampler():
