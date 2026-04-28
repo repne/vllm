@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Callable
+from contextlib import suppress
+
 import torch
 import torch._inductor.pattern_matcher as pm
 import torch.fx as fx
@@ -17,7 +20,12 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
 from ..inductor_pass import enable_fake_mode
-from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
+from ..vllm_inductor_pass import (
+    VllmFusionPatternMatcherPass,
+    VllmInductorPass,
+    VllmPatternMatcherPass,
+    VllmPatternReplacement,
+)
 
 FP8_DTYPE = current_platform.fp8_dtype()
 
@@ -371,50 +379,177 @@ class AllGatherCutlassScaledMMPattern(BasePattern):
         )
 
 
-class AsyncTPPass(VllmPatternMatcherPass):
+class FlashInferBMMFP8ReduceScatterPattern(
+    BasePattern, VllmPatternReplacement[..., torch.Tensor]
+):
+    def get_inputs(self) -> list[torch.Tensor]:
+        a_2d = torch.empty([16, 16], device=self.device, dtype=FP8_DTYPE)
+        b_2d = (
+            torch.empty([16, 16], device=self.device, dtype=FP8_DTYPE)
+            .contiguous()
+            .transpose(0, 1)
+        )
+        a_scale = torch.empty([1], device=self.device, dtype=torch.float32)
+        b_scale = torch.empty([1], device=self.device, dtype=torch.float32)
+        return [a_2d, b_2d, a_scale, b_scale]
+
+    @property
+    def pattern(self) -> Callable[..., torch.Tensor]:
+        def _pattern(
+            a_2d: torch.Tensor,
+            b_2d: torch.Tensor,
+            a_scale: torch.Tensor,
+            b_scale: torch.Tensor,
+        ) -> torch.Tensor:
+            bmm = torch.ops.vllm.bmm_fp8.default(
+                torch.ops.aten.unsqueeze.default(a_2d, 0),
+                torch.ops.aten.unsqueeze.default(b_2d, 0),
+                a_scale,
+                b_scale,
+                self.dtype,
+                "auto",
+            )
+            output = torch.ops.aten.reshape.default(bmm, list(bmm.shape[1:]))
+            return torch.ops.vllm.reduce_scatter.default(
+                output,
+                dim=0,
+                world_size=self.tp_size,
+                group_name=self.tp.unique_name,
+            )
+
+        return _pattern
+
+    @property
+    def replacement(self) -> Callable[..., torch.Tensor]:
+        def _replacement(
+            a_2d: torch.Tensor,
+            b_2d: torch.Tensor,
+            a_scale: torch.Tensor,
+            b_scale: torch.Tensor,
+        ) -> torch.Tensor:
+            return torch.ops.vllm.fused_flashinfer_scaled_matmul_reduce_scatter.default(
+                a_2d,
+                b_2d,
+                a_scale,
+                b_scale,
+                "sum",
+                0,
+                0,
+                self.tp.device_group.group_name,
+                [a_2d.shape[0], b_2d.shape[1]],
+                self.dtype,
+            )
+
+        return _replacement
+
+
+class FlashInferAllGatherBMMFP8Pattern(
+    BasePattern, VllmPatternReplacement[..., torch.Tensor]
+):
+    def get_inputs(self) -> list[torch.Tensor]:
+        a_shard_2d = torch.empty([8, 16], device=self.device, dtype=FP8_DTYPE)
+        b_2d = (
+            torch.empty([16, 16], device=self.device, dtype=FP8_DTYPE)
+            .contiguous()
+            .transpose(0, 1)
+        )
+        a_scale = torch.empty([1], device=self.device, dtype=torch.float32)
+        b_scale = torch.empty([1], device=self.device, dtype=torch.float32)
+        return [a_shard_2d, b_2d, a_scale, b_scale]
+
+    @property
+    def pattern(self) -> Callable[..., torch.Tensor]:
+        def _pattern(
+            a_shard_2d: torch.Tensor,
+            b_2d: torch.Tensor,
+            a_scale: torch.Tensor,
+            b_scale: torch.Tensor,
+        ) -> torch.Tensor:
+            all_gather = torch.ops.vllm.all_gather.default(
+                a_shard_2d,
+                dim=0,
+                world_size=self.tp_size,
+                group_name=self.tp.unique_name,
+            )
+            return torch.ops.vllm.bmm_fp8.default(
+                torch.ops.aten.unsqueeze.default(all_gather, 0),
+                torch.ops.aten.unsqueeze.default(b_2d, 0),
+                a_scale,
+                b_scale,
+                self.dtype,
+                "auto",
+            )
+
+        return _pattern
+
+    @property
+    def replacement(self) -> Callable[..., torch.Tensor]:
+        def _replacement(
+            a_shard_2d: torch.Tensor,
+            b_2d: torch.Tensor,
+            a_scale: torch.Tensor,
+            b_scale: torch.Tensor,
+        ) -> torch.Tensor:
+            fused = torch.ops.vllm.fused_all_gather_flashinfer_scaled_matmul.default(
+                a_shard_2d,
+                b_2d,
+                a_scale,
+                b_scale,
+                0,
+                self.tp.device_group.group_name,
+                self.dtype,
+            )
+            return torch.ops.aten.unsqueeze.default(fused, 0)
+
+        return _replacement
+
+
+class AsyncTPPass(VllmFusionPatternMatcherPass):
     @enable_fake_mode
     def __init__(self, config: VllmConfig) -> None:
-        super().__init__(config)
+        super().__init__(config, pass_name="async_tp_pass")
 
-        # Enable symmetric memory for the TP process group
         enable_symm_mem_for_group(get_tp_group().device_group.group_name)
-        self.patterns: PatternMatcherPass = PatternMatcherPass(
-            pass_name="async_tp_pass"
-        )
-        GEMMReduceScatterPattern(self.model_dtype, self.device).register(self.patterns)
+        GEMMReduceScatterPattern(self.model_dtype, self.device).register(self.pm_pass)
 
-        AllGatherGEMMPattern(self.model_dtype, self.device).register(self.patterns)
+        AllGatherGEMMPattern(self.model_dtype, self.device).register(self.pm_pass)
 
         # These fusions are enabled only for bfloat16 models because
         # `scaled_mm` or `cutlass_scaled_mm` with per-token (row-wise) scaling
         # only supports bfloat16 as the output dtype.
         if self.model_dtype == torch.bfloat16:
             ScaledMMReduceScatterPattern(self.model_dtype, self.device).register(
-                self.patterns
+                self.pm_pass
             )
             AllGatherScaledMMPattern(self.model_dtype, self.device).register(
-                self.patterns
+                self.pm_pass
             )
 
             CutlassScaledMMReduceScatterPattern(self.model_dtype, self.device).register(
-                self.patterns
+                self.pm_pass
             )
             AllGatherCutlassScaledMMPattern(self.model_dtype, self.device).register(
-                self.patterns
+                self.pm_pass
             )
+            with suppress(ImportError):
+                import vllm.utils.flashinfer  # noqa: F401
+            if hasattr(torch.ops.vllm, "bmm_fp8"):
+                self.register(
+                    FlashInferAllGatherBMMFP8Pattern(self.model_dtype, self.device)
+                )
+                self.register(
+                    FlashInferBMMFP8ReduceScatterPattern(self.model_dtype, self.device)
+                )
 
-        self.dump_patterns(config, self.patterns)
+        self.dump_patterns(config, self.pm_pass)
 
     def is_applicable_for_range(self, compile_range: Range) -> bool:
-        # This pass is applied on top of the sequence parallelism pass,
-        # which is only supported in fullgraph compilation mode.
-        assert (
-            self.compilation_config.use_inductor_graph_partition
-            or not self.compilation_config.splitting_ops
-        ), "AsyncTPPass requires full-graph compilation"
+        # AsyncTP patterns are only created after SP rewrites. If SP did not
+        # run for a range there is naturally nothing here to match.
         return True
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
-        self.matched_count = self.patterns.apply(graph)
+        self.matched_count = self.pm_pass.apply(graph)
+        VllmPatternMatcherPass.match_table[self.pass_name] += self.matched_count
         logger.debug("Replaced %s patterns", self.matched_count)

@@ -31,6 +31,7 @@ logger = init_logger(__name__)
 # Only apply sequence parallelism for models with hidden_size >= threshold
 SP_MIN_HIDDEN_SIZE: dict[int, int] = {
     90: 8192,  # H100: only for models with hidden_size >= 8192
+    100: 8192,  # Blackwell family: only for models with hidden_size >= 8192
 }
 
 # Min size per GPU per device capability for sequence parallelism
@@ -38,6 +39,8 @@ SP_MIN_HIDDEN_SIZE: dict[int, int] = {
 # This ensures the threshold scales appropriately with tensor parallelism
 SP_MIN_PER_GPU_SIZE_MB: dict[int, float] = {
     90: 8,  # 8MB per GPU for H100
+    # Use a more conservative threshold on Blackwell so TP8 starts later.
+    100: 32,
 }
 
 
@@ -67,7 +70,12 @@ def get_sequence_parallelism_threshold(
     capability = current_platform.get_device_capability()
     if capability is None:
         return None
-    device_capability = capability.to_int()
+
+    # Collapse Blackwell variants (sm100/sm103/...) into one policy bucket.
+    if current_platform.is_device_capability_family(100):
+        device_capability = 100
+    else:
+        device_capability = capability.to_int()
 
     # Check if device has configured thresholds
     min_hidden_size = SP_MIN_HIDDEN_SIZE.get(device_capability)
@@ -83,6 +91,27 @@ def get_sequence_parallelism_threshold(
     MiB = 1024 * 1024
     min_size = min_per_gpu_size_mb * MiB * tp_size
     return int(min_size // (hidden_size * element_size))
+
+
+def get_effective_sp_min_token_num(config: VllmConfig) -> int | None:
+    """Return the effective token threshold for SP compile-range gating.
+
+    `sp_min_token_num` is additionally capped by `max_num_batched_tokens` so
+    the pass never activates outside the scheduler's reachable batch-size
+    window.
+    """
+    if config.model_config is None:
+        return None
+
+    min_token_num = config.compilation_config.pass_config.sp_min_token_num
+    if min_token_num is None:
+        return None
+
+    max_batched = config.scheduler_config.max_num_batched_tokens
+    if max_batched is not None:
+        min_token_num = min(min_token_num, max_batched)
+
+    return min_token_num
 
 
 def get_first_out_wrapper(
@@ -359,22 +388,12 @@ class SequenceParallelismPass(VllmPatternMatcherPass):
     def __init__(self, config: VllmConfig) -> None:
         super().__init__(config)
 
-        # Get min_token_num threshold
-        # Read min_token_num from config (calculated during config init)
-        self.min_token_num = None
-        if config.model_config is not None:
-            pass_config = config.compilation_config.pass_config
-            self.min_token_num = pass_config.sp_min_token_num
-
-            if self.min_token_num is not None:
-                # Take the min to avoid exceeding max_num_batched_tokens
-                max_batched = config.scheduler_config.max_num_batched_tokens
-                if max_batched is not None:
-                    self.min_token_num = min(self.min_token_num, max_batched)
-                logger.debug_once(
-                    f"Sequence parallelism min token threshold: {self.min_token_num}",
-                    scope="global",
-                )
+        self.min_token_num = get_effective_sp_min_token_num(config)
+        if self.min_token_num is not None:
+            logger.debug_once(
+                f"Sequence parallelism min token threshold: {self.min_token_num}",
+                scope="global",
+            )
 
         # Used to clean up redundant views created temporarily
         # to circumvent residual shape change issues
@@ -406,30 +425,18 @@ class SequenceParallelismPass(VllmPatternMatcherPass):
         self.dump_patterns(config, self.patterns)
 
     def is_applicable_for_range(self, compile_range: Range) -> bool:
-        """
-        Determines if sequence parallelism should be applied for the given
-        compile range.
+        """Determines if sequence parallelism should be applied."""
+        if (
+            not self.compilation_config.use_inductor_graph_partition
+            and self.compilation_config.splitting_ops
+        ):
+            tp_size = get_tensor_model_parallel_world_size()
+            if not compile_range.is_single_size() or compile_range.end % tp_size != 0:
+                return False
 
-        SP is only beneficial for larger batch sizes where the communication
-        overhead is amortized. For small batches, the overhead of splitting
-        and gathering tensors across TP ranks outweighs the benefits.
-
-        Returns False (SP disabled) when:
-        - min_token_num is None (SP disabled for this device/config)
-        - The compile range starts below the minimum token threshold
-        """
-        assert (
-            self.compilation_config.use_inductor_graph_partition
-            or not self.compilation_config.splitting_ops
-        ), "SequenceParallelismPass requires full-graph compilation"
-
-        # min_token_num is None when SP is disabled for this device/config
-        # (e.g., non-CUDA platform, unsupported GPU, or small hidden_size)
-        if self.min_token_num is None:
-            return False
-
-        # Only apply SP when batch size meets the minimum threshold
-        return compile_range.start >= self.min_token_num
+        return (
+            self.min_token_num is not None and compile_range.start >= self.min_token_num
+        )
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
