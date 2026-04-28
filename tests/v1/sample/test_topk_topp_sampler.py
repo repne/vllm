@@ -739,3 +739,133 @@ class TestFlashInferTopkToppRobustness:
         # this test rather than a later, unrelated GPU op.
         torch.accelerator.synchronize()
         self._check_tokens(tokens, ctx=f"pattern={pattern}, path={path}")
+
+
+# =============================================================================
+# FlashInfer top-k/top-p distribution-match tests
+# =============================================================================
+
+
+@pytest.mark.skipif(
+    not FLASHINFER_TOPK_TOPP_SUPPORTED,
+    reason="FlashInfer top-k/top-p sampler requires CUDA "
+    "and a GPU with FlashInfer support.",
+)
+class TestFlashInferDistributionMatch:
+    """Chi-square goodness-of-fit: FlashInfer and PyTorch-native samplers
+    both reproduce the expected token distribution after top-k / top-p.
+
+    Regression guard against historical FlashInfer distribution-shift.
+    Each impl is compared to the theoretical distribution (softmax of
+    filtered logits); if both pass they are statistically equivalent
+    to each other by transitivity.
+    """
+
+    VOCAB = 32
+    N_SAMPLES = 50_000
+    ALPHA = 1e-6
+    SEED = 0
+
+    @pytest.mark.parametrize(
+        "topk,topp",
+        [
+            (8, None),
+            (16, None),
+            (None, 0.5),
+            (None, 0.7),
+            (None, 0.99),
+            (8, 0.9),
+            (4, 0.5),
+        ],
+    )
+    def test_distribution_matches_theoretical(self, topk, topp):
+        from scipy.stats import chisquare
+
+        from vllm.v1.sample.ops.topk_topp_sampler import (
+            apply_top_k_top_p,
+            flashinfer_sample,
+            random_sample,
+        )
+
+        torch.set_default_device(DEVICE_TYPE)
+        torch.manual_seed(self.SEED)
+
+        # Same logits row used for both impls so the comparison is fair.
+        logits_one = (
+            torch.randn(
+                (1, self.VOCAB),
+                dtype=torch.float32,
+            )
+            * 2.0
+        )
+
+        # Theoretical expected distribution from PyTorch-native filter.
+        k_one = torch.tensor([topk], dtype=torch.int32) if topk is not None else None
+        p_one = torch.tensor([topp], dtype=torch.float32) if topp is not None else None
+        masked = apply_top_k_top_p_pytorch(logits_one.clone(), k_one, p_one)
+        expected_probs = masked.softmax(dim=-1).flatten().cpu().numpy()
+        expected_counts = expected_probs * self.N_SAMPLES
+
+        # Build a batch of N identical rows for both impls.
+        batch = logits_one.expand(self.N_SAMPLES, self.VOCAB).contiguous()
+        k_batch = (
+            torch.full((self.N_SAMPLES,), topk, dtype=torch.int32)
+            if topk is not None
+            else None
+        )
+        p_batch = (
+            torch.full((self.N_SAMPLES,), topp, dtype=torch.float32)
+            if topp is not None
+            else None
+        )
+
+        # FlashInfer dispatch path.
+        fi_tokens = flashinfer_sample(batch.contiguous(), k_batch, p_batch, {})
+        fi_counts = torch.bincount(fi_tokens, minlength=self.VOCAB).cpu().numpy()
+        self._chi2_check(
+            fi_counts,
+            expected_counts,
+            chisquare,
+            label=f"flashinfer top-k={topk} top-p={topp}",
+        )
+
+        # PyTorch-native dispatch path (Triton-routed filter + Gumbel sample).
+        processed = apply_top_k_top_p(batch.clone(), k_batch, p_batch)
+        probs = processed.softmax(dim=-1, dtype=torch.float32)
+        pt_tokens = random_sample(probs, {})
+        pt_counts = torch.bincount(pt_tokens, minlength=self.VOCAB).cpu().numpy()
+        self._chi2_check(
+            pt_counts,
+            expected_counts,
+            chisquare,
+            label=f"native top-k={topk} top-p={topp}",
+        )
+
+    def _chi2_check(self, empirical, expected, chisquare_fn, *, label):
+        import numpy as np
+
+        # Hard check: the sampler must never produce a token outside the
+        # expected support (zero theoretical probability).
+        outside = (expected == 0) & (empirical > 0)
+        assert not outside.any(), (
+            f"{label}: sampled out-of-support tokens "
+            f"(zero expected prob): indices={outside.nonzero()[0].tolist()}"
+        )
+        # Skip chi-square in the degenerate case where the support
+        # collapses to a single token (e.g. very restrictive joint
+        # top-k + top-p): all samples must land there and the hard
+        # check above already verified they do.
+        in_support = expected > 0
+        if int(in_support.sum()) <= 1:
+            return
+        # Soft check: chi-square goodness-of-fit on in-support tokens.
+        # Cast to float64 so the rescaling step below stays within
+        # scipy.chisquare's strict 1.5e-8 sum-equality tolerance.
+        emp = empirical[in_support].astype(np.float64)
+        exp = expected[in_support].astype(np.float64)
+        exp = exp * (emp.sum() / exp.sum())
+        chi2, p_value = chisquare_fn(emp, exp)
+        assert p_value > self.ALPHA, (
+            f"{label}: distribution differs from theoretical: "
+            f"chi2={chi2:.2f} p_value={p_value:.2e} alpha={self.ALPHA}"
+        )
