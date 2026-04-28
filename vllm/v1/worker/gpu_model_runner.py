@@ -644,6 +644,7 @@ class GPUModelRunner(
             logitsprocs_need_output_token_ids=bool(custom_logitsprocs)
             or self.vllm_config.reasoning_config is not None,
             is_pooling_model=self.is_pooling_model,
+            is_hybrid=self.model_config.is_hybrid,
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
         )
 
@@ -723,6 +724,31 @@ class GPUModelRunner(
         self.num_accepted_tokens = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
         )
+
+        # Mamba state index for hybrid models - tracks which block contains
+        # the running mamba state. -1 means "no previous state" (new/resumed
+        # request). Uses CpuGpuBuffer like num_accepted_tokens.
+        self.mamba_state_idx = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+        # Initialize to -1 (sentinel for "no previous state")
+        self.mamba_state_idx.np.fill(-1)
+        self.mamba_state_idx.gpu.fill_(-1)
+
+        # Additional per-request metadata for GPU-side postprocess_mamba.
+        # These enable a future GPU kernel to compute mamba state copy decisions
+        # without CPU-GPU synchronization.
+        self.num_scheduled_tokens_buf = self._make_buffer(
+            self.max_num_reqs, dtype=torch.int32
+        )
+        self.num_computed_tokens_buf = self._make_buffer(
+            self.max_num_reqs, dtype=torch.int32
+        )
+        self.num_draft_tokens_buf = self._make_buffer(
+            self.max_num_reqs, dtype=torch.int32
+        )
+
+        # GPU postprocess context for mamba - created lazily after model load
+        # since we need to know num_state_types from the model.
+        self.mamba_gpu_postprocess_ctx: mamba_utils.MambaGPUContext | None = None
 
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -854,7 +880,6 @@ class GPUModelRunner(
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
-        self.mamba_state_idx: dict[str, int] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
         self.layerwise_nvtx_hooks_registered = False
 
@@ -1414,7 +1439,7 @@ class GPUModelRunner(
             return None
 
     def _update_states_after_model_execute(
-        self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
+        self, output_token_ids: torch.Tensor
     ) -> None:
         """Update the cached states after model execution.
 
@@ -1423,6 +1448,15 @@ class GPUModelRunner(
         the state are kept util we decide how many tokens are accepted for
         each sequence, and a shifting is done during the next iteration
         based on the number of accepted tokens.
+
+        Cache modes:
+        - "align" mode: Uses GPU-based postprocessing via a fused kernel to
+          handle mamba state copying without CPU-GPU synchronization. The
+          required metadata (num_scheduled_tokens, num_draft_tokens,
+          num_computed_tokens) is pre-synced to GPU buffers during
+          _prepare_inputs.
+        - non-"align" mode: Simply copies the accepted token counts to CPU
+          asynchronously for use in the next iteration's preprocessing.
         """
         if not self.speculative_config or not self.model_config.is_hybrid:
             return
@@ -1437,26 +1471,62 @@ class GPUModelRunner(
         self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
 
         if self.cache_config.mamba_cache_mode == "align":
-            for i, num_tokens in enumerate(
-                self.num_accepted_tokens.gpu[:num_reqs].cpu().numpy()
-            ):
-                self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
-            mamba_utils.postprocess_mamba(
-                scheduler_output,
-                self.kv_cache_config,
-                self.input_batch,
-                self.requests,
-                self.mamba_state_idx,
-                self.compilation_config.static_forward_context,
-                self.model.get_mamba_state_copy_func(),
-                self._get_mamba_copy_bufs(),
+            # Use GPU-based postprocess to avoid CPU-GPU sync.
+            # Lazily create the GPU postprocess context on first use.
+            mamba_copy_funcs = self.model.get_mamba_state_copy_func()
+            if self.mamba_gpu_postprocess_ctx is None:
+                self.mamba_gpu_postprocess_ctx = mamba_utils.MambaGPUContext.create(
+                    max_num_reqs=self.max_num_reqs,
+                    kv_cache_config=self.kv_cache_config,
+                    num_state_types=len(mamba_copy_funcs),
+                    device=self.device,
+                )
+
+            # Initialize metadata from forward_context if not done yet.
+            ctx = self.mamba_gpu_postprocess_ctx
+            if not ctx.is_initialized:
+                ctx.initialize_from_forward_context(
+                    self.kv_cache_config,
+                    self.compilation_config.static_forward_context,
+                    mamba_copy_funcs,
+                )
+
+            # Get the mamba block table (use first mamba group). NOTE 1: The
+            # code assumes all mamba groups share the same block table mapping
+            # as in mamba_utils get_mamba_groups(..)
+            mamba_group_id = ctx.mamba_group_ids[0]
+            block_table_gpu = self.input_batch.block_table[
+                mamba_group_id
+            ].get_device_tensor(num_reqs)
+
+            # Run fused GPU postprocess.
+            ctx.run_fused_postprocess(
+                num_reqs=num_reqs,
+                num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
+                mamba_state_idx_gpu=self.mamba_state_idx.gpu,
+                num_scheduled_tokens_gpu=self.num_scheduled_tokens_buf.gpu,
+                num_computed_tokens_gpu=self.num_computed_tokens_buf.gpu,
+                num_draft_tokens_gpu=self.num_draft_tokens_buf.gpu,
+                block_table_gpu=block_table_gpu,
+            )
+
+            # Copy from ctx.num_accepted_tokens_out which is pre-initialized
+            # from num_accepted_tokens_gpu. The kernel only overwrites values
+            # to 1 when src_block_idx == dest_block_idx (copy within same block);
+            # for all other requests, the original accepted token count is preserved.
+            self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+                ctx.num_accepted_tokens_out[:num_reqs], non_blocking=True
             )
         else:
             self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
                 self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
             )
-            assert self.num_accepted_tokens_event is not None
-            self.num_accepted_tokens_event.record()
+
+        # In both cases we do a non-blocking copy of results to CPU for next iteration's
+        # preprocess (self.input_batch.num_accepted_tokens_cpu_tensor). So we need to
+        # record the event for proper synchronization.
+        assert self.num_accepted_tokens_event is not None
+        self.num_accepted_tokens_event.record()
 
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
@@ -3953,7 +4023,6 @@ class GPUModelRunner(
                     scheduler_output,
                     self.kv_cache_config,
                     self.cache_config,
-                    self.mamba_state_idx,
                     self.input_batch,
                     self.requests,
                     self.compilation_config.static_forward_context,
@@ -3968,6 +4037,29 @@ class GPUModelRunner(
                     self.input_batch.num_accepted_tokens_cpu[:num_reqs]
                 )
                 self.num_accepted_tokens.copy_to_gpu(num_reqs)
+
+                # Sync mamba_state_idx to GPU (similar to num_accepted_tokens).
+                self.mamba_state_idx.np[:num_reqs] = (
+                    self.input_batch.mamba_state_idx_cpu[:num_reqs]
+                )
+                self.mamba_state_idx.copy_to_gpu(num_reqs)
+
+                # Sync additional per-request metadata for GPU postprocess_mamba.
+                # These values don't change between _prepare_inputs and
+                # _update_states_after_model_execute, so syncing here is safe.
+                scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+                for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                    req_state = self.requests[req_id]
+                    self.num_scheduled_tokens_buf.np[i] = (
+                        scheduler_output.num_scheduled_tokens[req_id]
+                    )
+                    self.num_computed_tokens_buf.np[i] = req_state.num_computed_tokens
+                    self.num_draft_tokens_buf.np[i] = len(
+                        scheduled_spec_tokens.get(req_id, [])
+                    )
+                self.num_scheduled_tokens_buf.copy_to_gpu(num_reqs)
+                self.num_computed_tokens_buf.copy_to_gpu(num_reqs)
+                self.num_draft_tokens_buf.copy_to_gpu(num_reqs)
 
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
@@ -4183,9 +4275,7 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
-        self._update_states_after_model_execute(
-            sampler_output.sampled_token_ids, scheduler_output
-        )
+        self._update_states_after_model_execute(sampler_output.sampled_token_ids)
         if self.use_async_scheduling:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
@@ -6508,6 +6598,7 @@ class GPUModelRunner(
                 logitsprocs=self.input_batch.logitsprocs,
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,
+                is_hybrid=self.model_config.is_hybrid,
             )
 
         assert self._init_block_sizes == block_sizes, (
