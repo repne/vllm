@@ -319,6 +319,17 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 quant_config=quant_config,
                 prefix=f"{prefix}.in_proj",
             )
+            # Pre-compute the per-rank split sizes used to peel
+            # mixed_qkvzba -> (mixed_qkvz, ba) -> (mixed_qkv, z) on every
+            # forward; these are static for the life of the module.
+            self._fused_qkvz_size = (
+                2 * self.key_dim + 2 * self.value_dim
+            ) // self.tp_size
+            self._fused_ba_size = (2 * self.num_v_heads) // self.tp_size
+            self._fused_qkv_size = (
+                2 * self.key_dim + self.value_dim
+            ) // self.tp_size
+            self._fused_z_size = self.value_dim // self.tp_size
         elif create_in_proj_qkvz:
             self.in_proj_qkvz = self.create_qkvz_proj(
                 hidden_size=self.hidden_size,
@@ -566,16 +577,15 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         if getattr(self, "_fuse_in_proj", False):
             # Fused 6-way path (Qwen3.5 non-LoRA): single GEMM covering
             # [q, k, v, z, b, a]; split the result and continue with the
-            # standard non-interleaved unpacking.
+            # standard non-interleaved unpacking. Split sizes are computed
+            # once in __init__ and cached on self.
             mixed, _ = self.in_proj(hidden_states)
-            qkvz_size = (
-                2 * self.key_dim + 2 * self.value_dim
-            ) // self.tp_size
-            ba_size = (2 * self.num_v_heads) // self.tp_size
-            mixed_qkvz, ba = mixed.split([qkvz_size, ba_size], dim=-1)
-            qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
-            z_size = self.value_dim // self.tp_size
-            mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
+            mixed_qkvz, ba = mixed.split(
+                [self._fused_qkvz_size, self._fused_ba_size], dim=-1
+            )
+            mixed_qkv, z = mixed_qkvz.split(
+                [self._fused_qkv_size, self._fused_z_size], dim=-1
+            )
             z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
             b = b.contiguous()
