@@ -139,6 +139,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
                 create_in_proj_qkvz=vllm_config.lora_config is None,
+                fuse_in_proj_ba=vllm_config.lora_config is None,
             )
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3NextAttention(
@@ -283,22 +284,29 @@ class Qwen3_5Model(Qwen3NextModel):
             # mlp
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
-            ("in_proj_ba", "in_proj_b", 0),
-            ("in_proj_ba", "in_proj_a", 1),
         ]
 
         if self.enable_lora:
+            # LoRA path keeps in_proj_qkv, in_proj_z, and in_proj_ba as
+            # separate modules so adapters can attach to each independently.
             stacked_params_mapping.extend(
                 [
+                    ("in_proj_ba", "in_proj_b", 0),
+                    ("in_proj_ba", "in_proj_a", 1),
                     ("in_proj_qkv", "in_proj_qkv", (0, 1, 2)),
                     ("in_proj_z", "in_proj_z", 0),
                 ]
             )
         else:
+            # Non-LoRA: route all four GDN input-projection checkpoint
+            # tensors into a single 6-way merged `in_proj`
+            # (output_sizes=[k, k, v, v, num_v_heads, num_v_heads]).
             stacked_params_mapping.extend(
                 [
-                    ("in_proj_qkvz", "in_proj_qkv", (0, 1, 2)),
-                    ("in_proj_qkvz", "in_proj_z", 3),
+                    ("in_proj", "in_proj_qkv", (0, 1, 2)),
+                    ("in_proj", "in_proj_z", 3),
+                    ("in_proj", "in_proj_b", 4),
+                    ("in_proj", "in_proj_a", 5),
                 ]
             )
 
@@ -459,9 +467,8 @@ class Qwen3_5ForCausalLMBase(
             "v_proj",
         ],
         "gate_up_proj": ["gate_proj", "up_proj"],
-        # GDN fused projections.
-        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
-        "in_proj_ba": ["in_proj_b", "in_proj_a"],
+        # GDN 6-way fused input projection (non-LoRA path).
+        "in_proj": ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"],
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -485,14 +492,19 @@ class Qwen3_5ForCausalLMBase(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
 
-        # When LoRA is enabled, GDN uses separate in_proj_qkv and in_proj_z
-        # instead of merged in_proj_qkvz; pack mapping must match.
+        # When LoRA is enabled, GDN uses separate in_proj_qkv, in_proj_z, and
+        # in_proj_ba (no 6-way fuse) so adapters can attach to each module;
+        # pack mapping must match.
         if vllm_config.lora_config:
             base = getattr(Qwen3_5ForCausalLMBase, "packed_modules_mapping", {})
             self.packed_modules_mapping = {k: list(v) for k, v in base.items()}
-            self.packed_modules_mapping.pop("in_proj_qkvz", None)
+            self.packed_modules_mapping.pop("in_proj", None)
             self.packed_modules_mapping["in_proj_qkv"] = ["in_proj_qkv"]
             self.packed_modules_mapping["in_proj_z"] = ["in_proj_z"]
+            self.packed_modules_mapping["in_proj_ba"] = [
+                "in_proj_b",
+                "in_proj_a",
+            ]
 
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
@@ -579,8 +591,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
     supports_multimodal_pruning = False
 
     packed_modules_mapping = Qwen3VLForConditionalGeneration.packed_modules_mapping | {
-        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
-        "in_proj_ba": ["in_proj_b", "in_proj_a"],
+        # GDN 6-way fused input projection (non-LoRA path).
+        "in_proj": ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"],
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
@@ -615,15 +627,20 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         )
 
     def update_packed_mapping(self, enable_lora: bool):
-        # When LoRA is enabled, GDN uses separate in_proj_qkv and in_proj_z
+        # When LoRA is enabled, GDN uses separate in_proj_qkv, in_proj_z, and
+        # in_proj_ba (no 6-way fuse) so adapters can attach independently.
         if enable_lora:
             base = getattr(
                 Qwen3_5ForConditionalGeneration, "packed_modules_mapping", {}
             )
             self.packed_modules_mapping = {k: list(v) for k, v in base.items()}
-            self.packed_modules_mapping.pop("in_proj_qkvz", None)
+            self.packed_modules_mapping.pop("in_proj", None)
             self.packed_modules_mapping["in_proj_qkv"] = ["in_proj_qkv"]
             self.packed_modules_mapping["in_proj_z"] = ["in_proj_z"]
+            self.packed_modules_mapping["in_proj_ba"] = [
+                "in_proj_b",
+                "in_proj_a",
+            ]
 
     def embed_input_ids(
         self,
