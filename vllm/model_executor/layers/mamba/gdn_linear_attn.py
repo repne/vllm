@@ -299,26 +299,50 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         #    kept separate so LoRA adapters can attach independently;
         #    in_proj_ba stays as its own merged param.
         self._fuse_in_proj = (
-            fuse_in_proj_ba
-            and create_in_proj_qkvz
-            and not gqa_interleaved_layout
+            fuse_in_proj_ba and create_in_proj_qkvz and not gqa_interleaved_layout
         )
 
         if self._fuse_in_proj:
-            self.in_proj = MergedColumnParallelLinear(
-                input_size=self.hidden_size,
-                output_sizes=[
-                    self.key_dim,
-                    self.key_dim,
-                    self.value_dim,
-                    self.value_dim,
-                    self.num_v_heads,
-                    self.num_v_heads,
-                ],
-                bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.in_proj",
-            )
+            try:
+                self.in_proj = MergedColumnParallelLinear(
+                    input_size=self.hidden_size,
+                    output_sizes=[
+                        self.key_dim,
+                        self.key_dim,
+                        self.value_dim,
+                        self.value_dim,
+                        self.num_v_heads,
+                        self.num_v_heads,
+                    ],
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.in_proj",
+                )
+            except ValueError as e:
+                # Defense in depth: if the model class did not detect that
+                # the four packed sub-modules have non-uniform quantization
+                # skip status (e.g. a future quant config exposing a
+                # skip-list under an attribute name we don't probe in
+                # qwen3_5._QUANT_SKIP_LIST_ATTRS), the quant config's
+                # mixed-precision sentinel raises a ValueError inside
+                # `MergedColumnParallelLinear`. Both `is_layer_skipped`
+                # (fp8/awq/modelopt/...) and `should_ignore_layer`
+                # (compressed-tensors) raise distinct messages; match both.
+                err_msg = str(e)
+                fused_mismatch = (
+                    "All shards of fused layers" in err_msg
+                    or "different quantization schemes" in err_msg
+                )
+                if not fused_mismatch:
+                    raise
+                self._fuse_in_proj = False
+                pmm = getattr(quant_config, "packed_modules_mapping", None)
+                if pmm is not None:
+                    pmm.pop("in_proj", None)
+                    pmm["in_proj_qkvz"] = ["in_proj_qkv", "in_proj_z"]
+                    pmm["in_proj_ba"] = ["in_proj_b", "in_proj_a"]
+
+        if self._fuse_in_proj:
             # Pre-compute the per-rank split sizes used to peel
             # mixed_qkvzba -> (mixed_qkvz, ba) -> (mixed_qkv, z) on every
             # forward; these are static for the life of the module.
@@ -326,9 +350,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 2 * self.key_dim + 2 * self.value_dim
             ) // self.tp_size
             self._fused_ba_size = (2 * self.num_v_heads) // self.tp_size
-            self._fused_qkv_size = (
-                2 * self.key_dim + self.value_dim
-            ) // self.tp_size
+            self._fused_qkv_size = (2 * self.key_dim + self.value_dim) // self.tp_size
             self._fused_z_size = self.value_dim // self.tp_size
         elif create_in_proj_qkvz:
             self.in_proj_qkvz = self.create_qkvz_proj(
