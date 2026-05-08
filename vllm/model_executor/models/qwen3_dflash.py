@@ -65,6 +65,7 @@ class DFlashQwen3Attention(nn.Module):
         rms_norm_eps: float = 1e-06,
         attention_bias: bool = False,
         cache_config: CacheConfig | None = None,
+        sliding_window: int | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
@@ -116,6 +117,7 @@ class DFlashQwen3Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             cache_config=cache_config,
             quant_config=quant_config,
+            per_layer_sliding_window=sliding_window,
             prefix=f"{prefix}.attn",
             attn_type=attn_type,
         )
@@ -176,6 +178,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             rope_parameters=config.rope_parameters,
+            sliding_window=getattr(config, "sliding_window", None),
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
         )
