@@ -103,3 +103,29 @@ def test_initialize_kv_cache_for_kv_sharing_no_attn_groups():
     assert len(kv_cache_groups) == 2
     assert kv_cache_groups[0].layer_names == ["model.layers.0", "model.layers.2"]
     assert kv_cache_groups[1].layer_names == ["model.layers.1", "model.layers.3"]
+
+def test_dflash_draft_kv_groups_keep_hybrid_tensor_sharing():
+    """DFlash draft model with KV cache sharing keeps tensors shared."""
+    from types import SimpleNamespace
+
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(method="dflash"),
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+    )
+    kv_cache_groups = [
+        KVCacheGroupSpec(["model.layers.0", "model.layers.1"], new_kv_cache_spec()),
+        KVCacheGroupSpec(["model.layers.2", "model.layers.3"], new_kv_cache_spec()),
+    ]
+    num_blocks = 8
+    kv_cache_config = get_kv_cache_config_from_groups(
+        vllm_config=vllm_config,
+        kv_cache_groups=kv_cache_groups,
+        available_memory=new_kv_cache_spec().page_size_bytes * 2 * num_blocks,
+    )
+    assert kv_cache_config.num_blocks == num_blocks
+    assert [tensor.shared_by for tensor in kv_cache_config.kv_cache_tensors] == [
+        ["model.layers.0", "model.layers.2"],
+        ["model.layers.1", "model.layers.3"],
+    ]
