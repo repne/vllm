@@ -1494,6 +1494,7 @@ class SpecDecodeBaseProposer:
 
     def allow_multiple_draft_kv_cache_groups(self) -> bool:
         return False
+
     def initialize_attn_backend(
         self,
         kv_cache_config: KVCacheConfig,

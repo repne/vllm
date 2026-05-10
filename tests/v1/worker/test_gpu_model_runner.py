@@ -1532,9 +1532,6 @@ def test_mamba_cache_raises_when_max_num_seqs_exceeds_blocks():
         with pytest.raises(ValueError, match="max_num_seqs"):
             runner.initialize_kv_cache(kv_cache_config)
 
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-
-
 @pytest.mark.parametrize(
     "physical_order",
     [

@@ -6855,6 +6855,11 @@ class GPUModelRunner(
                         kernel_num_blocks,
                     )
                     dtype = kv_cache_spec.dtype
+                    # Among all physical orders observed for this shared raw tensor
+                    # across different attention groups, prefer a block-major order
+                    # ("block", "kv", ...) to avoid unnecessary strided views — this
+                    # is the most common allocation pattern. sorted() provides
+                    # deterministic tie-breaking when multiple orders exist.
                     shared_orders = raw_tensor_physical_orders[id(raw_tensor)]
                     block_major_orders = (
                         order for order in shared_orders if order[:2] == ("block", "kv")
