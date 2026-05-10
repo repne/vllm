@@ -105,6 +105,78 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+# Attribute names used across vLLM quantization configs to expose the
+# "do not quantize these layers" list. We probe all of them so the
+# detection works for fp8/fbgemm/mxfp4 (`ignored_layers`),
+# compressed-tensors (`ignore`), modelopt FP8/NVFP4 (`exclude_modules`),
+# awq/awq_marlin/fp_quant/cpu_wna16/moe_wna16 (`modules_to_not_convert`),
+# and torchao (`skip_modules`). Any future config that follows the same
+# `is_layer_skipped`-style pattern is also defended by the try/except
+# fallback in `GatedDeltaNetAttention`.
+_QUANT_SKIP_LIST_ATTRS: tuple[str, ...] = (
+    "ignored_layers",
+    "ignore",
+    "exclude_modules",
+    "modules_to_not_convert",
+    "skip_modules",
+)
+
+
+def _quant_skip_list(quant_config) -> list[str] | None:
+    if quant_config is None:
+        return None
+    for attr in _QUANT_SKIP_LIST_ATTRS:
+        v = getattr(quant_config, attr, None)
+        if v:
+            return v
+    return None
+
+
+def _in_proj_can_fuse(quant_config) -> bool:
+    """Return True iff GDN's four input-projection sub-modules
+    (in_proj_qkv, in_proj_z, in_proj_b, in_proj_a) share a uniform
+    quantization-skip status under ``quant_config``.
+
+    The 6-way fused ``in_proj`` MergedColumnParallelLinear requires every
+    packed shard to use the same quant scheme. Checkpoints such as
+    Qwen/Qwen3.5-27B-FP8 keep ``in_proj_a``/``in_proj_b`` in bf16 while
+    quantizing ``in_proj_qkv``/``in_proj_z`` to FP8 — that mix can't be
+    packed together, so we fall back to the unfused
+    ``in_proj_qkvz`` + ``in_proj_ba`` layout.
+    """
+    skip_list = _quant_skip_list(quant_config)
+    if not skip_list:
+        return True
+    sub_names = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
+    seen: set[str] = set()
+    for entry in skip_list:
+        for sub in sub_names:
+            if entry == sub or entry.endswith(f".{sub}"):
+                seen.add(sub)
+    return not seen or seen == set(sub_names)
+
+
+def _install_unfused_in_proj_mapping(
+    base_class: type, quant_config, target_attrs_owner
+) -> dict[str, list[str]]:
+    """Build the unfused (qkvz + ba) packed-modules mapping, install it on
+    ``target_attrs_owner.packed_modules_mapping`` AND on
+    ``quant_config.packed_modules_mapping`` so that ``is_layer_skipped`` sees
+    the correct fused-shard layout when each of the unfused sub-modules is
+    instantiated. ``configure_quant_config`` only snapshots the class-level
+    mapping at startup, so we have to push the updated dict into the quant
+    config explicitly here."""
+    base = getattr(base_class, "packed_modules_mapping", {})
+    new_mapping: dict[str, list[str]] = {k: list(v) for k, v in base.items()}
+    new_mapping.pop("in_proj", None)
+    new_mapping["in_proj_qkvz"] = ["in_proj_qkv", "in_proj_z"]
+    new_mapping["in_proj_ba"] = ["in_proj_b", "in_proj_a"]
+    target_attrs_owner.packed_modules_mapping = new_mapping
+    if quant_config is not None:
+        quant_config.packed_modules_mapping = new_mapping
+    return new_mapping
+
+
 class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self):
         return self.ctx.get_hf_config(Qwen3_5Config)
@@ -121,6 +193,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         vllm_config: VllmConfig,
         layer_type: str,
         prefix: str = "",
+        fuse_in_proj_ba: bool | None = None,
     ) -> None:
         super(Qwen3NextDecoderLayer, self).__init__()
 
@@ -132,13 +205,20 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
 
+        if fuse_in_proj_ba is None:
+            fuse_in_proj_ba = vllm_config.lora_config is None and _in_proj_can_fuse(
+                quant_config
+            )
+        create_in_proj_qkvz = vllm_config.lora_config is None
+
         if self.layer_type == "linear_attention":
             self.linear_attn = GatedDeltaNetAttention(
                 config=config,
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
-                create_in_proj_qkvz=vllm_config.lora_config is None,
+                create_in_proj_qkvz=create_in_proj_qkvz,
+                fuse_in_proj_ba=fuse_in_proj_ba,
             )
         elif self.layer_type == "full_attention":
             self.self_attn = Qwen3NextAttention(
@@ -218,6 +298,11 @@ class Qwen3_5Model(Qwen3NextModel):
 
         self.config = config
         self.enable_lora = vllm_config.lora_config is not None
+        # 6-way fused in_proj is only valid when LoRA is off AND every
+        # packed shard shares the same quantization-skip status.
+        self._fuse_in_proj_ba = not self.enable_lora and _in_proj_can_fuse(
+            vllm_config.quant_config
+        )
 
         self.vocab_size = config.vocab_size
 
@@ -226,11 +311,14 @@ class Qwen3_5Model(Qwen3NextModel):
             config.hidden_size,
         )
 
+        fuse_in_proj_ba = self._fuse_in_proj_ba
+
         def get_layer(prefix: str):
             return Qwen3_5DecoderLayer(
                 vllm_config,
                 layer_type=config.layer_types[extract_layer_index(prefix)],
                 prefix=prefix,
+                fuse_in_proj_ba=fuse_in_proj_ba,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
@@ -283,22 +371,52 @@ class Qwen3_5Model(Qwen3NextModel):
             # mlp
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
-            ("in_proj_ba", "in_proj_b", 0),
-            ("in_proj_ba", "in_proj_a", 1),
         ]
 
+        # Source of truth for the GDN in_proj layout is the actual module
+        # tree, not `_fuse_in_proj_ba` — `GatedDeltaNetAttention.__init__`
+        # may have fallen back to the unfused layout via its try/except
+        # defense-in-depth path even when the model-class detection said
+        # fusing was OK (unknown future quant config).
+        gdn_fused_in_proj = any(
+            getattr(m, "_fuse_in_proj", False)
+            for m in self.modules()
+            if isinstance(m, GatedDeltaNetAttention)
+        )
+
         if self.enable_lora:
+            # LoRA path keeps in_proj_qkv, in_proj_z, and in_proj_ba as
+            # separate modules so adapters can attach to each independently.
             stacked_params_mapping.extend(
                 [
+                    ("in_proj_ba", "in_proj_b", 0),
+                    ("in_proj_ba", "in_proj_a", 1),
                     ("in_proj_qkv", "in_proj_qkv", (0, 1, 2)),
                     ("in_proj_z", "in_proj_z", 0),
                 ]
             )
+        elif gdn_fused_in_proj:
+            # Non-LoRA, uniform precision: route all four GDN input-projection
+            # checkpoint tensors into a single 6-way merged `in_proj`
+            # (output_sizes=[k, k, v, v, num_v_heads, num_v_heads]).
+            stacked_params_mapping.extend(
+                [
+                    ("in_proj", "in_proj_qkv", (0, 1, 2)),
+                    ("in_proj", "in_proj_z", 3),
+                    ("in_proj", "in_proj_b", 4),
+                    ("in_proj", "in_proj_a", 5),
+                ]
+            )
         else:
+            # Non-LoRA, mixed precision (e.g. Qwen3.5-27B-FP8): qkvz and ba
+            # remain separate MergedColumnParallelLinear modules so each can
+            # carry its own quant scheme.
             stacked_params_mapping.extend(
                 [
                     ("in_proj_qkvz", "in_proj_qkv", (0, 1, 2)),
                     ("in_proj_qkvz", "in_proj_z", 3),
+                    ("in_proj_ba", "in_proj_b", 0),
+                    ("in_proj_ba", "in_proj_a", 1),
                 ]
             )
 
@@ -459,9 +577,8 @@ class Qwen3_5ForCausalLMBase(
             "v_proj",
         ],
         "gate_up_proj": ["gate_proj", "up_proj"],
-        # GDN fused projections.
-        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
-        "in_proj_ba": ["in_proj_b", "in_proj_a"],
+        # GDN 6-way fused input projection (non-LoRA path).
+        "in_proj": ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"],
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -485,14 +602,27 @@ class Qwen3_5ForCausalLMBase(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
 
-        # When LoRA is enabled, GDN uses separate in_proj_qkv and in_proj_z
-        # instead of merged in_proj_qkvz; pack mapping must match.
+        # The packed_modules_mapping must match what GDN actually instantiated.
+        # Three layouts:
+        #   * fused 6-way `in_proj` (default class-level mapping above)
+        #   * unfused `in_proj_qkvz` + `in_proj_ba` (mixed-precision quant
+        #     checkpoints such as Qwen3.5-27B-FP8 that skip in_proj_a/b but
+        #     quantize in_proj_qkv/z)
+        #   * LoRA layout: separate in_proj_qkv, in_proj_z, in_proj_ba
         if vllm_config.lora_config:
             base = getattr(Qwen3_5ForCausalLMBase, "packed_modules_mapping", {})
             self.packed_modules_mapping = {k: list(v) for k, v in base.items()}
-            self.packed_modules_mapping.pop("in_proj_qkvz", None)
+            self.packed_modules_mapping.pop("in_proj", None)
             self.packed_modules_mapping["in_proj_qkv"] = ["in_proj_qkv"]
             self.packed_modules_mapping["in_proj_z"] = ["in_proj_z"]
+            self.packed_modules_mapping["in_proj_ba"] = [
+                "in_proj_b",
+                "in_proj_a",
+            ]
+        elif not _in_proj_can_fuse(vllm_config.quant_config):
+            _install_unfused_in_proj_mapping(
+                Qwen3_5ForCausalLMBase, vllm_config.quant_config, self
+            )
 
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
@@ -579,14 +709,18 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
     supports_multimodal_pruning = False
 
     packed_modules_mapping = Qwen3VLForConditionalGeneration.packed_modules_mapping | {
-        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
-        "in_proj_ba": ["in_proj_b", "in_proj_a"],
+        # GDN 6-way fused input projection (non-LoRA path).
+        "in_proj": ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"],
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
         # protocols have not __init__ method, so we need to use nn.Module.__init__
         nn.Module.__init__(self)
-        self.update_packed_mapping(enable_lora=vllm_config.lora_config is not None)
+        self.update_packed_mapping(
+            enable_lora=vllm_config.lora_config is not None,
+            in_proj_can_fuse=_in_proj_can_fuse(vllm_config.quant_config),
+            quant_config=vllm_config.quant_config,
+        )
         config: Qwen3_5Config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
@@ -614,16 +748,34 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             self.language_model.make_empty_intermediate_tensors
         )
 
-    def update_packed_mapping(self, enable_lora: bool):
-        # When LoRA is enabled, GDN uses separate in_proj_qkv and in_proj_z
+    def update_packed_mapping(
+        self,
+        enable_lora: bool,
+        in_proj_can_fuse: bool = True,
+        quant_config=None,
+    ):
+        # The packed_modules_mapping must match the layout that GDN actually
+        # instantiates. Three layouts:
+        #   * fused 6-way `in_proj` (default class-level mapping)
+        #   * unfused `in_proj_qkvz` + `in_proj_ba` (mixed-precision quant
+        #     checkpoints such as Qwen3.5-27B-FP8)
+        #   * LoRA: separate in_proj_qkv, in_proj_z, in_proj_ba
         if enable_lora:
             base = getattr(
                 Qwen3_5ForConditionalGeneration, "packed_modules_mapping", {}
             )
             self.packed_modules_mapping = {k: list(v) for k, v in base.items()}
-            self.packed_modules_mapping.pop("in_proj_qkvz", None)
+            self.packed_modules_mapping.pop("in_proj", None)
             self.packed_modules_mapping["in_proj_qkv"] = ["in_proj_qkv"]
             self.packed_modules_mapping["in_proj_z"] = ["in_proj_z"]
+            self.packed_modules_mapping["in_proj_ba"] = [
+                "in_proj_b",
+                "in_proj_a",
+            ]
+        elif not in_proj_can_fuse:
+            _install_unfused_in_proj_mapping(
+                Qwen3_5ForConditionalGeneration, quant_config, self
+            )
 
     def embed_input_ids(
         self,
@@ -811,7 +963,11 @@ class Qwen3_5MoeForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
         # protocols have not __init__ method, so we need to use nn.Module.__init__
         nn.Module.__init__(self)
-        self.update_packed_mapping(enable_lora=vllm_config.lora_config is not None)
+        self.update_packed_mapping(
+            enable_lora=vllm_config.lora_config is not None,
+            in_proj_can_fuse=_in_proj_can_fuse(vllm_config.quant_config),
+            quant_config=vllm_config.quant_config,
+        )
         config: Qwen3_5MoeConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
