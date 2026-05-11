@@ -292,7 +292,9 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         config: Qwen3NextConfig,
         vllm_config: VllmConfig,
         prefix: str = "",
+        create_in_proj_qkvz: bool = True,
         gqa_interleaved_layout=False,
+        fuse_in_proj_ba: bool = False,
     ) -> None:
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -346,28 +348,109 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
-        # projection of the input hidden states
-        # Qwen3-Next and Qwen3.5 has a different qkv_proj layout,
-        # we need to create qkvz_proj adaptively here.
-        # When create_in_proj_qkvz is False (e.g. LoRA enabled in Qwen3.5),
-        # in_proj_qkv and in_proj_z are created separately instead.
-        self.in_proj_qkvz = self.create_qkvz_proj(
-            hidden_size=self.hidden_size,
-            key_dim=self.key_dim,
-            value_dim=self.value_dim,
-            quant_config=quant_config,
-            prefix=f"{prefix}.in_proj_qkvz",
+        # Three layouts:
+        # 1. Fused 6-way merge (fuse_in_proj_ba=True, Qwen3.5 non-LoRA non-
+        #    interleaved): one MergedColumnParallelLinear covering
+        #    [q, k, v, z, b, a] in a single GEMM. The `ba` projection has
+        #    output dim ~0.5% of `qkvz`, so fusing them costs essentially
+        #    nothing extra and removes the need for any cross-stream dispatch
+        #    or custom-op wrapper to recover the projection-overlap win.
+        # 2. Separate qkvz + ba (default, Qwen3-Next interleaved + Qwen3.5
+        #    LoRA fallback).
+        # 3. LoRA path (create_in_proj_qkvz=False): in_proj_qkv and in_proj_z
+        #    kept separate so LoRA adapters can attach independently;
+        #    in_proj_ba stays as its own merged param.
+        self._fuse_in_proj = (
+            fuse_in_proj_ba and create_in_proj_qkvz and not gqa_interleaved_layout
         )
 
+        if self._fuse_in_proj:
+            try:
+                self.in_proj = MergedColumnParallelLinear(
+                    input_size=self.hidden_size,
+                    output_sizes=[
+                        self.key_dim,
+                        self.key_dim,
+                        self.value_dim,
+                        self.value_dim,
+                        self.num_v_heads,
+                        self.num_v_heads,
+                    ],
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.in_proj",
+                )
+            except ValueError as e:
+                # Defense in depth: if the model class did not detect that
+                # the four packed sub-modules have non-uniform quantization
+                # skip status (e.g. a future quant config exposing a
+                # skip-list under an attribute name we don't probe in
+                # qwen3_5._QUANT_SKIP_LIST_ATTRS), the quant config's
+                # mixed-precision sentinel raises a ValueError inside
+                # `MergedColumnParallelLinear`. Both `is_layer_skipped`
+                # (fp8/awq/modelopt/...) and `should_ignore_layer`
+                # (compressed-tensors) raise distinct messages; match both.
+                err_msg = str(e)
+                fused_mismatch = (
+                    "All shards of fused layers" in err_msg
+                    or "different quantization schemes" in err_msg
+                )
+                if not fused_mismatch:
+                    raise
+                self._fuse_in_proj = False
+                pmm = getattr(quant_config, "packed_modules_mapping", None)
+                if pmm is not None:
+                    pmm.pop("in_proj", None)
+                    pmm["in_proj_qkvz"] = ["in_proj_qkv", "in_proj_z"]
+                    pmm["in_proj_ba"] = ["in_proj_b", "in_proj_a"]
+
+        if self._fuse_in_proj:
+            # Pre-compute the per-rank split sizes used to peel
+            # mixed_qkvzba -> (mixed_qkvz, ba) -> (mixed_qkv, z) on every
+            # forward; these are static for the life of the module.
+            self._fused_qkvz_size = (
+                2 * self.key_dim + 2 * self.value_dim
+            ) // self.tp_size
+            self._fused_ba_size = (2 * self.num_v_heads) // self.tp_size
+            self._fused_qkv_size = (2 * self.key_dim + self.value_dim) // self.tp_size
+            self._fused_z_size = self.value_dim // self.tp_size
+        elif create_in_proj_qkvz:
+            self.in_proj_qkvz = self.create_qkvz_proj(
+                hidden_size=self.hidden_size,
+                key_dim=self.key_dim,
+                value_dim=self.value_dim,
+                quant_config=quant_config,
+                prefix=f"{prefix}.in_proj_qkvz",
+            )
+        else:
+            # LoRA case (Qwen3.5 only): keep q/k/v and z as separate modules
+            # so that LoRA adapters can be applied independently.
+            self.in_proj_qkv = MergedColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_sizes=[self.key_dim, self.key_dim, self.value_dim],
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.in_proj_qkv",
+            )
+            self.in_proj_z = ColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_size=self.value_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.in_proj_z",
+            )
         # ba_proj doesn't support blockwise fp8 quantization.
         # Qwen3-Next and Qwen3.5 have different in_proj_ba checkpoint
         # layouts, so we use a factory method to create the projection.
-        self.in_proj_ba = self.create_ba_proj(
-            hidden_size=self.hidden_size,
-            num_v_heads=self.num_v_heads,
-            quant_config=quant_config,
-            prefix=f"{prefix}.in_proj_ba",
-        )
+        # When fused into in_proj, ba is part of the merged GEMM and no
+        # separate module is needed.
+        if not self._fuse_in_proj:
+            self.in_proj_ba = self.create_ba_proj(
+                hidden_size=self.hidden_size,
+                num_v_heads=self.num_v_heads,
+                quant_config=quant_config,
+                prefix=f"{prefix}.in_proj_ba",
+            )
 
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
@@ -750,11 +833,35 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        ba, _ = self.in_proj_ba(hidden_states)
-
-        if self.gqa_interleaved_layout:
+        if getattr(self, "_fuse_in_proj", False):
+            # Fused 6-way path (Qwen3.5 non-LoRA): single GEMM covering
+            # [q, k, v, z, b, a]; split the result and continue with the
+            # standard non-interleaved unpacking. Split sizes are computed
+            # once in __init__ and cached on self.
+            mixed, _ = self.in_proj(hidden_states)
+            mixed_qkvz, ba = mixed.split(
+                [self._fused_qkvz_size, self._fused_ba_size], dim=-1
+            )
+            mixed_qkv, z = mixed_qkvz.split(
+                [self._fused_qkv_size, self._fused_z_size], dim=-1
+            )
+            z = z.reshape(z.size(0), -1, self.head_v_dim)
+            b, a = ba.chunk(2, dim=-1)
+            b = b.contiguous()
+            a = a.contiguous()
+        elif hasattr(self, "in_proj_qkv"):
+            # LoRA path (Qwen3.5 only): separate in_proj_qkv and in_proj_z
+            mixed_qkv, _ = self.in_proj_qkv(hidden_states)
+            ba, _ = self.in_proj_ba(hidden_states)
+            z, _ = self.in_proj_z(hidden_states)
+            z = z.reshape(z.size(0), -1, self.head_v_dim)
+            b, a = ba.chunk(2, dim=-1)
+            b = b.contiguous()
+            a = a.contiguous()
+        elif self.gqa_interleaved_layout:
             # Qwen3-Next: unpack the interleaved GQA layout
+            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            ba, _ = self.in_proj_ba(hidden_states)
             query, key, value, z, b, a = self.fix_query_key_value_ordering(
                 mixed_qkvz, ba
             )
@@ -763,7 +870,9 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
         else:
-            # Qwen3.5: weights are already in [q, k, v, z] and [b, a] order
+            # Qwen3.5 (unfused): weights are in [q, k, v, z] and [b, a] order
+            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            ba, _ = self.in_proj_ba(hidden_states)
             qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
             z_size = self.value_dim // self.tp_size
             mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
