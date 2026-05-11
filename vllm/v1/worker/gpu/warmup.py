@@ -157,6 +157,16 @@ def warmup_kernels(
     if drafter is not None and hasattr(drafter, "dry_run_helper_kernels"):
         drafter.dry_run_helper_kernels()
 
+    # Also exercise the drafter's forward pass (attention kernels).
+    # The V2 speculator.propose() path covers Eagle; DFlash has no speculator
+    # so the drafter's non-causal forward (merge_attn_states_kernel) would
+    # otherwise JIT on the first real request.
+    if drafter is not None and hasattr(drafter, "dummy_run"):
+        drafter.dummy_run(
+            num_tokens=model_runner.max_num_reqs,
+            use_cudagraphs=False,
+        )
+
     # Clean up - process finish_req_ids.
     cleanup_output = SchedulerOutput.make_empty()
     cleanup_output.finished_req_ids = set(req_ids)

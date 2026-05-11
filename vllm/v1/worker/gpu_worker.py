@@ -789,6 +789,20 @@ class Worker(WorkerBase):
         if hasattr(drafter, "dry_run_helper_kernels"):
             drafter.dry_run_helper_kernels()
 
+        max_num_reqs = self.model_runner.max_num_reqs
+
+        # Also exercise the drafter's forward pass (including attention kernels).
+        # The target model's dummy_run (above) warms causal attention but
+        # DFlash uses non-causal attention (causal=False) which hits different
+        # FlashInfer kernel variants and a different merge_attn_states_kernel
+        # JIT cache entry.  Warm it here so the first real request does not
+        # pay a cold JIT cost.
+        if hasattr(drafter, "dummy_run"):
+            drafter.dummy_run(
+                num_tokens=max_num_reqs,
+                use_cudagraphs=False,
+            )
+
         # Also warm the async-spec ``@torch.compile`` correction owned by
         # the model runner (V1 only -- V2 does not call it).
         if not getattr(self.model_runner, "use_async_spec_decode", False):
@@ -797,7 +811,6 @@ class Worker(WorkerBase):
             update_num_computed_tokens_for_batch_change,
         )
 
-        max_num_reqs = self.model_runner.max_num_reqs
         device = self.device
         prev_positions = torch.zeros(max_num_reqs, dtype=torch.int64, device=device)
         valid_sampled_token_count = torch.zeros(
