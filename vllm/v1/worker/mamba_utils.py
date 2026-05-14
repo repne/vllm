@@ -219,64 +219,6 @@ def preprocess_mamba(
     do_mamba_copy_block(copy_bufs)
 
 
-def can_skip_mamba_postprocess(
-    scheduler_output: SchedulerOutput,
-    input_batch: GPUInputBatch,
-    requests: dict[str, CachedRequestState],
-    mamba_block_size: int,
-    num_reqs: int,
-) -> bool:
-    """Return True iff `postprocess_mamba` is provably a no-op this step.
-
-    `postprocess_mamba` (below) only mutates state inside the inner
-    conditional
-
-        aligned_new_computed_tokens >= num_tokens_running_state
-
-    where
-        num_tokens_running_state = num_computed + num_scheduled - num_draft
-        new_num_computed_tokens  = num_tokens_running_state + num_accepted - 1
-        aligned                  = (new_num_computed_tokens // bs) * bs
-
-    We do not know ``num_accepted`` without a GPU sync, but it is upper-
-    bounded by ``n_draft + 1`` for each request (drafts + the bonus
-    token). If even the worst-case value cannot push any request across
-    a block boundary, the function is provably a no-op and the caller
-    can defer the device-to-host sync of ``num_accepted_tokens``.
-
-    The check is per-request and uses only CPU-side state, so it adds a
-    small constant-time cost per scheduler step regardless of skip rate.
-
-    IMPORTANT: this predicate is logically coupled to the inner
-    conditional in :func:`postprocess_mamba` below. If that conditional
-    changes (different alignment policy, new boundary cases), this
-    predicate MUST be updated in lockstep.
-    """
-    if not mamba_block_size or mamba_block_size <= 0:
-        # Unknown / degenerate layout: stay on the safe slow path.
-        return False
-    num_scheduled = scheduler_output.num_scheduled_tokens
-    spec_decode = scheduler_output.scheduled_spec_decode_tokens
-    req_ids = input_batch.req_ids
-    for i in range(num_reqs):
-        req_id = req_ids[i]
-        req_state = requests[req_id]
-        n_draft = len(spec_decode.get(req_id, ()))
-        n_running = (
-            req_state.num_computed_tokens
-            + num_scheduled[req_id]
-            - n_draft
-        )
-        # Worst case: num_accepted == n_draft + 1 → new_num_computed grows
-        # by n_draft. n_draft is per-request (0 for prefill iters, ≤
-        # num_speculative_tokens otherwise), giving a tighter bound than
-        # the global config value.
-        max_new = n_running + n_draft
-        if (max_new // mamba_block_size) * mamba_block_size >= n_running:
-            return False
-    return True
-
-
 def postprocess_mamba(
     scheduler_output: SchedulerOutput,
     kv_cache_config: KVCacheConfig,
