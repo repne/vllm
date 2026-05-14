@@ -18,7 +18,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
-from vllm.v1.worker.gpu_input_batch import NO_PREV_MAMBA_STATE_ID, CachedRequestState
+from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
 
 
@@ -614,6 +614,7 @@ def preprocess_mamba(
     scheduler_output: SchedulerOutput,
     kv_cache_config: KVCacheConfig,
     cache_config: CacheConfig,
+    mamba_state_idx: dict[str, int],
     input_batch: GPUInputBatch,
     requests: dict[str, CachedRequestState],
     forward_context: dict[str, Any],
@@ -623,49 +624,31 @@ def preprocess_mamba(
     """
     Copy the mamba state of previous step to the last
     (1 + num_speculative_blocks) block.
-
-    Uses input_batch.mamba_state_idx_cpu[req_index] to track which block
-    contains the running mamba state for each request. ``NO_PREV_MAMBA_STATE_ID`` means
-    "no previous state" (new/resumed request, compute from num_computed_tokens).
     """
-    assert input_batch.mamba_state_idx_cpu is not None, (
-        "mamba_state_idx_cpu is None - preprocess_mamba should only be called "
-        "for hybrid models (is_hybrid=True)"
-    )
     mamba_group_ids = copy_bufs.mamba_group_ids
     mamba_spec = copy_bufs.mamba_spec
     num_speculative_blocks = mamba_spec.num_speculative_blocks
     # TODO(Chen): we need to optimize this function a lot
     assert cache_config.enable_prefix_caching
     block_size = mamba_spec.block_size
-
-    # Clear mamba_state_idx for finished/preempted/resumed requests.
-    # Mirrors the pre-refactor dict-based path: sweep all three sets as a
-    # safety net. remove_request() already resets finished/preempted slots,
-    # but force-preemption paths (e.g. reset_prefix_cache / KV cache flush)
-    # can surface a request in resumed_req_ids without a matching
-    # preempted_req_ids entry, leaving a stale curr_state_idx that would
-    # point past the new (smaller) block allocation.
     finished_req_ids = scheduler_output.finished_req_ids
     preempted_req_ids = scheduler_output.preempted_req_ids or set()
+    # We need to clear mamba_state_idx for resumed requests. When requests are
+    # force-preempted (e.g., during reset_prefix_cache / KV cache flush),
+    # they appear in resumed_req_ids without a corresponding entry in
+    # preempted_req_ids, leaving stale mamba_state_idx entries that can
+    # point to block indices beyond the new (smaller) block allocation.
     resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
     for req_id in itertools.chain(finished_req_ids, preempted_req_ids, resumed_req_ids):
-        req_index = input_batch.req_id_to_index.get(req_id)
-        if req_index is not None:
-            input_batch.mamba_state_idx_cpu[req_index] = NO_PREV_MAMBA_STATE_ID
+        mamba_state_idx.pop(req_id, None)
 
     copy_bufs.offset = 0
     for i, req_id in enumerate(input_batch.req_ids):
         req_state = requests[req_id]
-        prev_state_idx = input_batch.mamba_state_idx_cpu[i]
-        if (
-            prev_state_idx == NO_PREV_MAMBA_STATE_ID
-            and req_state.num_computed_tokens > 0
-        ):
-            # new / resumed request: derive the source block from the last
-            # fully-computed token. If num_computed_tokens == 0 there is no
-            # source state, so leave prev_state_idx as NO_PREV_MAMBA_STATE_ID
-            # and let the guard below skip the copy.
+        prev_state_idx = mamba_state_idx.get(req_id)
+        if prev_state_idx is None:
+            # new / resumed request, no previous state
+            # if num_computed_tokens is 0, prev_state_idx will be -1
             prev_state_idx = (req_state.num_computed_tokens - 1) // block_size
 
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
@@ -685,11 +668,8 @@ def preprocess_mamba(
         # Block 3: speculative block
         # And use block 1 to save the running state.
         curr_state_idx = num_blocks - 1 - num_speculative_blocks
-        input_batch.mamba_state_idx_cpu[i] = curr_state_idx
-        if (
-            prev_state_idx != NO_PREV_MAMBA_STATE_ID
-            and prev_state_idx != curr_state_idx
-        ):
+        mamba_state_idx[req_id] = curr_state_idx
+        if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
             collect_mamba_copy_meta(
                 copy_bufs,
                 kv_cache_config,
@@ -703,3 +683,30 @@ def preprocess_mamba(
             )
             input_batch.num_accepted_tokens_cpu[i] = 1
     do_mamba_copy_block(copy_bufs)
+
+
+def stage_mamba_state_idx_to_gpu(
+    mamba_state_idx: dict[str, int],
+    req_ids: list[str],
+    num_reqs: int,
+    gpu_buf: CpuGpuBuffer,
+) -> None:
+    """Materialize ``mamba_state_idx`` into ``gpu_buf`` and copy to GPU.
+
+    Walks ``req_ids[:num_reqs]`` in batch order, writing each request's block
+    index into the buffer's pinned numpy view, then issues a non-blocking H→D
+    copy. The fused kernel indexes the resulting GPU tensor by ``req_idx``.
+
+    Invariant: ``preprocess_mamba`` must have run first for the same batch so
+    that every ``req_ids[i]`` has an entry in ``mamba_state_idx``.
+    """
+    np_view = gpu_buf.np
+    for i in range(num_reqs):
+        req_id = req_ids[i]
+        state_idx = mamba_state_idx.get(req_id)
+        assert state_idx is not None, (
+            f"mamba_state_idx missing entry for {req_id!r}; "
+            "preprocess_mamba must run before stage_mamba_state_idx_to_gpu"
+        )
+        np_view[i] = state_idx
+    gpu_buf.copy_to_gpu(num_reqs)

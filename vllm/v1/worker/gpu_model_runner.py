@@ -195,7 +195,6 @@ from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu.pool.late_interaction_runner import LateInteractionRunner
 from vllm.v1.worker.gpu_input_batch import (
-    NO_PREV_MAMBA_STATE_ID,
     CachedRequestState,
     InputBatch,
 )
@@ -673,7 +672,6 @@ class GPUModelRunner(
             logitsprocs_need_output_token_ids=bool(custom_logitsprocs)
             or self.vllm_config.reasoning_config is not None,
             is_pooling_model=self.is_pooling_model,
-            is_hybrid=self.model_config.is_hybrid,
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
             reasoning_config=self.vllm_config.reasoning_config,
         )
@@ -755,12 +753,12 @@ class GPUModelRunner(
             self.max_num_reqs, dtype=torch.int32
         )
 
-        # Mamba state index for hybrid models - tracks which block contains
-        # the running mamba state. ``NO_PREV_MAMBA_STATE_ID`` means "no previous state"
-        # (new/resumed request). Uses CpuGpuBuffer like num_accepted_tokens.
-        self.mamba_state_idx = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
-        self.mamba_state_idx.np.fill(NO_PREV_MAMBA_STATE_ID)
-        self.mamba_state_idx.gpu.fill_(NO_PREV_MAMBA_STATE_ID)
+        # GPU snapshot of ``self.mamba_state_idx`` (the dict). Materialized
+        # in the staging path before each fused mamba postprocess kernel
+        # launch. Indexed by ``req_idx``.
+        self.mamba_state_idx_buf = self._make_buffer(
+            self.max_num_reqs, dtype=torch.int32
+        )
 
         # Additional per-request metadata used to compute mamba state copy
         # decisions on GPU without CPU-GPU synchronization.
@@ -906,6 +904,7 @@ class GPUModelRunner(
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
+        self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
         self.layerwise_nvtx_hooks_registered = False
 
@@ -1550,7 +1549,7 @@ class GPUModelRunner(
             ctx.run_fused_postprocess(
                 num_reqs=num_reqs,
                 num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
-                mamba_state_idx_gpu=self.mamba_state_idx.gpu,
+                mamba_state_idx_gpu=self.mamba_state_idx_buf.gpu,
                 num_scheduled_tokens_gpu=self.num_scheduled_tokens_buf.gpu,
                 num_computed_tokens_gpu=self.num_computed_tokens_buf.gpu,
                 num_draft_tokens_gpu=self.num_draft_tokens_buf.gpu,
@@ -4144,6 +4143,7 @@ class GPUModelRunner(
                     scheduler_output,
                     self.kv_cache_config,
                     self.cache_config,
+                    self.mamba_state_idx,
                     self.input_batch,
                     self.requests,
                     self.compilation_config.static_forward_context,
@@ -4160,11 +4160,12 @@ class GPUModelRunner(
                 self.num_accepted_tokens.copy_to_gpu(num_reqs)
 
                 # Stage mamba_state_idx into the GPU buffer (non-blocking H→D copy)
-                assert self.input_batch.mamba_state_idx_cpu is not None
-                self.mamba_state_idx.np[:num_reqs] = (
-                    self.input_batch.mamba_state_idx_cpu[:num_reqs]
+                mamba_utils.stage_mamba_state_idx_to_gpu(
+                    self.mamba_state_idx,
+                    self.input_batch.req_ids,
+                    num_reqs,
+                    self.mamba_state_idx_buf,
                 )
-                self.mamba_state_idx.copy_to_gpu(num_reqs)
 
                 # Stage per-request postprocess metadata into GPU buffers
                 # (non-blocking). These values don't change between
@@ -6864,7 +6865,6 @@ class GPUModelRunner(
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,
                 reasoning_config=self.vllm_config.reasoning_config,
-                is_hybrid=self.model_config.is_hybrid,
             )
 
         assert self._init_block_sizes == block_sizes, (
