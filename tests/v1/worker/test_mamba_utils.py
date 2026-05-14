@@ -105,27 +105,23 @@ def _make_scheduler_output(
 def test_resumed_req_ids_cleared_from_mamba_state_idx():
     """When a request is force-preempted (e.g. reset_prefix_cache),
     it appears in resumed_req_ids but NOT in preempted_req_ids.
-    preprocess_mamba must still reset its mamba_state_idx_cpu entry to -1,
+    preprocess_mamba must still clear its mamba_state_idx entry,
     otherwise stale indices can point beyond the new block allocation.
-
-    Note: finished and preempted requests are now handled by
-    input_batch.remove_request() which sets mamba_state_idx_cpu[req_index] = -1.
-    preprocess_mamba only handles resumed_req_ids that weren't removed.
     """
     spec = MagicMock(block_size=64, num_speculative_blocks=0)
     cache_config = MagicMock(enable_prefix_caching=True)
-
-    # Set up input_batch with mamba_state_idx_cpu as a numpy array.
-    # The "resumed" request is at index 0 with a stale mamba_state_idx of 3.
     input_batch = MagicMock(req_ids=[])
-    input_batch.mamba_state_idx_cpu = np.array([3, -1, -1, -1], dtype=np.int32)
-    input_batch.req_id_to_index = {"resumed": 0}
-
     copy_bufs = MagicMock(mamba_group_ids=[0], mamba_spec=spec)
 
+    mamba_state_idx: dict[str, int] = {
+        "finished": 1,
+        "preempted": 2,
+        "resumed": 3,  # only in resumed_req_ids, NOT in preempted
+        "keep": 99,
+    }
     sched = _make_scheduler_output(
-        finished_req_ids=set(),
-        preempted_req_ids=set(),
+        finished_req_ids={"finished"},
+        preempted_req_ids={"preempted"},
         resumed_req_ids={"resumed"},
     )
 
@@ -137,6 +133,7 @@ def test_resumed_req_ids_cleared_from_mamba_state_idx():
             sched,
             MagicMock(),  # kv_cache_config
             cache_config,
+            mamba_state_idx,
             input_batch,
             {},  # requests
             {},  # forward_context
@@ -144,8 +141,7 @@ def test_resumed_req_ids_cleared_from_mamba_state_idx():
             copy_bufs,
         )
 
-    # The resumed request's mamba_state_idx should be reset to -1
-    assert input_batch.mamba_state_idx_cpu[0] == -1
+    assert mamba_state_idx == {"keep": 99}
 
 
 # -----------------------------------------------------------------------------
