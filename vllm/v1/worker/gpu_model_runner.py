@@ -1490,10 +1490,33 @@ class GPUModelRunner(
         self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
 
         if self.cache_config.mamba_cache_mode == "align":
-            for i, num_tokens in enumerate(
-                self.num_accepted_tokens.gpu[:num_reqs].cpu().numpy()
+            # Defer the GPU->CPU sync of `num_accepted_tokens` when the
+            # downstream `postprocess_mamba` is provably a no-op this
+            # step. The predicate lives next to `postprocess_mamba` in
+            # `mamba_utils` so the two stay updated in lockstep if the
+            # inner conditional ever changes.
+            copy_bufs = self._get_mamba_copy_bufs()
+            if mamba_utils.can_skip_mamba_postprocess(
+                scheduler_output,
+                self.input_batch,
+                self.requests,
+                copy_bufs.mamba_spec.block_size,
+                num_reqs,
             ):
-                self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
+                # Async device-to-host copy; the event.synchronize() in
+                # `_prepare_inputs` (after the draft forwards) absorbs
+                # the wait. By then the GPU has long since finished the
+                # copy, so the synchronize is essentially free.
+                self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+                    self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
+                )
+                assert self.num_accepted_tokens_event is not None
+                self.num_accepted_tokens_event.record()
+                return
+            # Slow path: at least one request may cross a boundary, so
+            # we need the values on CPU now for `postprocess_mamba`.
+            np_arr = self.num_accepted_tokens.gpu[:num_reqs].cpu().numpy()
+            self.input_batch.num_accepted_tokens_cpu[:num_reqs] = np_arr
             mamba_utils.postprocess_mamba(
                 scheduler_output,
                 self.kv_cache_config,
@@ -1502,7 +1525,7 @@ class GPUModelRunner(
                 self.mamba_state_idx,
                 self.compilation_config.static_forward_context,
                 self.model.get_mamba_state_copy_func(),
-                self._get_mamba_copy_bufs(),
+                copy_bufs,
             )
         else:
             self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
