@@ -313,6 +313,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         self.act = ACT2FN[config.hidden_act]
         self.layer_norm_epsilon = config.rms_norm_eps
         self.prefix = prefix
+        self._layer_name = _encode_layer_name(prefix)
         self.config = config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -811,7 +812,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 z,
                 core_attn_out,
                 fast_kernel=True,
-                layer_name=_encode_layer_name(self.prefix),
+                layer_name=self._layer_name,
             )
 
             self._output_projection(core_attn_out, z, output, num_tokens)
@@ -847,8 +848,6 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             )
             z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
-            b = b.contiguous()
-            a = a.contiguous()
         elif hasattr(self, "in_proj_qkv"):
             # LoRA path (Qwen3.5 only): separate in_proj_qkv and in_proj_z
             mixed_qkv, _ = self.in_proj_qkv(hidden_states)
@@ -856,8 +855,6 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             z, _ = self.in_proj_z(hidden_states)
             z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
-            b = b.contiguous()
-            a = a.contiguous()
         elif self.gqa_interleaved_layout:
             # Qwen3-Next: unpack the interleaved GQA layout
             mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
@@ -878,8 +875,6 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
             z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
-            b = b.contiguous()
-            a = a.contiguous()
 
         # ============================================================
         # Part 2: Core Attention (Custom Op)
@@ -898,7 +893,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             a,
             core_attn_out,
             fast_kernel=False,
-            layer_name=_encode_layer_name(self.prefix),
+            layer_name=self._layer_name,
         )
 
         # ============================================================
@@ -994,7 +989,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             b,
             a,
             core_attn_out,
-            _encode_layer_name(self.prefix),
+            self._layer_name,
         )
 
         z_shape_og = z.shape

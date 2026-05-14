@@ -203,6 +203,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         quant_config = vllm_config.quant_config
 
         self.layer_type = layer_type
+        self._is_linear_attn = (layer_type == "linear_attention")
         self.layer_idx = extract_layer_index(prefix)
 
         if fuse_in_proj_ba is None:
@@ -211,7 +212,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             )
         create_in_proj_qkvz = vllm_config.lora_config is None
 
-        if self.layer_type == "linear_attention":
+        if self._is_linear_attn:
             self.linear_attn = GatedDeltaNetAttention(
                 config=config,
                 vllm_config=vllm_config,
@@ -272,6 +273,10 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                     config.hidden_size,
                 ),
             )
+            self._attn_layer_scale_cached: torch.Tensor | None = None
+            self._attn_layer_scale_dtype: torch.dtype | None = None
+            self._ffn_layer_scale_cached: torch.Tensor | None = None
+            self._ffn_layer_scale_dtype: torch.dtype | None = None
 
 
 @support_torch_compile(
@@ -665,6 +670,13 @@ class Qwen3_5ForCausalLMBase(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Vocab-parallel argmax without all-gathering full logits."""
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(

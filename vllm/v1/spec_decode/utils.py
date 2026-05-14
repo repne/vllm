@@ -248,26 +248,24 @@ def compute_new_slot_mapping(
     max_model_len: int,
 ):
     batch_size, n_blocks_per_req = cad.block_table_tensor.shape
-    req_indices = torch.arange(batch_size, device=cad.query_start_loc.device)
+    total_tokens = len(new_positions)
+    device = cad.query_start_loc.device
+
+    req_indices = torch.arange(batch_size, device=device)
     req_indices = torch.repeat_interleave(
         req_indices,
         cad.naive_query_lens() + num_new_tokens,
-        output_size=len(new_positions),
+        output_size=total_tokens,
     )
-    # Clamp the positions to prevent an out-of-bounds error when indexing
-    # into block_table_tensor.
+    # Clamp positions to prevent OOB in block_table_tensor.
     clamped_positions = torch.clamp(new_positions, max=max_model_len - 1)
-    block_table_indices = (
+    block_nums = cad.block_table_tensor.view(-1)[
         req_indices * n_blocks_per_req + clamped_positions // block_size
-    )
-    block_nums = cad.block_table_tensor.view(-1)[block_table_indices]
-    block_offsets = clamped_positions % block_size
-    new_slot_mapping = block_nums * block_size + block_offsets
-    # Mask out the position ids that exceed the max model length.
-    exceeds_max_model_len = new_positions >= max_model_len
-    new_slot_mapping.masked_fill_(exceeds_max_model_len, PADDING_SLOT_ID)
-    # Mask out rejected tokens to prevent saves to the KV cache.
-    new_slot_mapping.masked_fill_(is_rejected_token_mask, PADDING_SLOT_ID)
+    ]
+    new_slot_mapping = block_nums * block_size + clamped_positions % block_size
+    # Fuse the two masked_fill_ calls into one mask.
+    mask = (new_positions >= max_model_len) | is_rejected_token_mask
+    new_slot_mapping.masked_fill_(mask, PADDING_SLOT_ID)
     return new_slot_mapping
 
 

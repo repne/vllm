@@ -334,6 +334,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         quant_config = vllm_config.quant_config
 
         self.layer_type = layer_type
+        self._is_linear_attn = (layer_type == "linear_attention")
         self.layer_idx = extract_layer_index(prefix)
 
         if self.layer_type == "linear_attention":
@@ -397,6 +398,10 @@ class Qwen3NextDecoderLayer(nn.Module):
                     config.hidden_size,
                 ),
             )
+            self._attn_layer_scale_cached: torch.Tensor | None = None
+            self._attn_layer_scale_dtype: torch.dtype | None = None
+            self._ffn_layer_scale_cached: torch.Tensor | None = None
+            self._ffn_layer_scale_dtype: torch.dtype | None = None
 
     def forward(
         self,
@@ -412,48 +417,52 @@ class Qwen3NextDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         self_attention_output = torch.empty_like(hidden_states)
-        if self.layer_type == "linear_attention":
+        if self._is_linear_attn:
             self.linear_attn(
                 hidden_states=hidden_states,
                 output=self_attention_output,
             )
-        elif self.layer_type == "full_attention":
+        else:
             self.self_attn(
                 hidden_states=hidden_states,
                 output=self_attention_output,
                 positions=positions,
             )
-        else:
-            raise ValueError("Invalid layer_type")
         hidden_states = self_attention_output
 
         if self.layer_scale:
-            if len(hidden_states.shape) == 2:
-                hidden_states = hidden_states * (
-                    self.attn_layer_scale.to(hidden_states.dtype)[0] + 1
-                )
+            hs_dtype = hidden_states.dtype
+            if torch.compiler.is_compiling():
+                cached = self.attn_layer_scale.to(hs_dtype)
             else:
-                hidden_states = hidden_states * (
-                    self.attn_layer_scale.to(hidden_states.dtype) + 1
-                )
+                if self._attn_layer_scale_dtype != hs_dtype:
+                    self._attn_layer_scale_cached = self.attn_layer_scale.to(hs_dtype)
+                    self._attn_layer_scale_dtype = hs_dtype
+                cached = self._attn_layer_scale_cached
+                assert cached is not None
+            if hidden_states.ndim == 2:
+                hidden_states = hidden_states * (cached[0] + 1)
+            else:
+                hidden_states = hidden_states * (cached + 1)
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
 
         if self.layer_scale:
-            if len(hidden_states.shape) == 2:
-                hidden_states = hidden_states * (
-                    self.ffn_layer_scale.to(hidden_states.dtype)[0] + 1
-                )
+            hs_dtype = hidden_states.dtype
+            if torch.compiler.is_compiling():
+                cached = self.ffn_layer_scale.to(hs_dtype)
             else:
-                assert len(hidden_states.shape) == len(self.ffn_layer_scale.shape), (
-                    f"shape must be the same {len(hidden_states.shape)}, "
-                    f"{len(self.ffn_layer_scale.shape)}"
-                )
-                hidden_states = hidden_states * (
-                    self.ffn_layer_scale.to(hidden_states.dtype) + 1
-                )
+                if self._ffn_layer_scale_dtype != hs_dtype:
+                    self._ffn_layer_scale_cached = self.ffn_layer_scale.to(hs_dtype)
+                    self._ffn_layer_scale_dtype = hs_dtype
+                cached = self._ffn_layer_scale_cached
+                assert cached is not None
+            if hidden_states.ndim == 2:
+                hidden_states = hidden_states * (cached[0] + 1)
+            else:
+                hidden_states = hidden_states * (cached + 1)
 
         return hidden_states, residual
 
@@ -816,6 +825,13 @@ class Qwen3NextForCausalLM(
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Vocab-parallel argmax without all-gathering full logits."""
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(

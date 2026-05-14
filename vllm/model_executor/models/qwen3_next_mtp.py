@@ -295,6 +295,13 @@ class Qwen3NextMTP(nn.Module, QwenNextMixtureOfExperts):
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Vocab-parallel argmax without all-gathering full logits."""
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         shared_weight_names = ["embed_tokens", "lm_head"]
 

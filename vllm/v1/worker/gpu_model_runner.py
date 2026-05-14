@@ -2241,7 +2241,7 @@ class GPUModelRunner(
             # window size when capturing to make sure the correct kernel is selected.
             max_seq_len = self.max_model_len
         else:
-            max_seq_len = self.optimistic_seq_lens_cpu.numpy()[:num_reqs].max().item()
+            max_seq_len = self.optimistic_seq_lens_cpu[:num_reqs].max().item()
 
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
 

@@ -152,6 +152,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dtype=torch.int32,
             device=device,
         )
+        self.non_spec_query_start_loc_cpu: torch.Tensor = torch.empty(
+            (self.decode_cudagraph_max_bs + 1,),
+            dtype=torch.int32,
+        )
 
     def build(  # type: ignore[override]
         self,
@@ -280,35 +284,34 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     ~spec_sequence_masks_cpu, 0
                 ]
 
-                spec_query_start_loc = torch.zeros(
-                    num_spec_decodes + 1,
-                    dtype=torch.int32,
-                    device=query_start_loc.device,
-                )
+                # Reuse pre-allocated buffers instead of torch.zeros
+                spec_buf = self.spec_query_start_loc[: num_spec_decodes + 1]
+                spec_buf.zero_()
                 torch.cumsum(
                     query_lens[spec_sequence_masks_cpu],
                     dim=0,
-                    out=spec_query_start_loc[1:],
+                    out=spec_buf[1:],
                 )
-                non_spec_query_start_loc = torch.zeros(
-                    query_lens.size(0) - num_spec_decodes + 1,
-                    dtype=torch.int32,
-                    device=query_start_loc.device,
-                )
+                spec_query_start_loc = spec_buf
+
+                non_spec_size = query_lens.size(0) - num_spec_decodes + 1
+                non_spec_buf = self.non_spec_query_start_loc[:non_spec_size]
+                non_spec_buf.zero_()
                 torch.cumsum(
                     query_lens[~spec_sequence_masks_cpu],
                     dim=0,
-                    out=non_spec_query_start_loc[1:],
+                    out=non_spec_buf[1:],
                 )
-                non_spec_query_start_loc_cpu = torch.zeros(
-                    query_lens_cpu.size(0) - num_spec_decodes + 1,
-                    dtype=torch.int32,
-                )
+                non_spec_query_start_loc = non_spec_buf
+
+                non_spec_cpu_buf = self.non_spec_query_start_loc_cpu[:non_spec_size]
+                non_spec_cpu_buf.zero_()
                 torch.cumsum(
                     query_lens_cpu[~spec_sequence_masks_cpu],
                     dim=0,
-                    out=non_spec_query_start_loc_cpu[1:],
+                    out=non_spec_cpu_buf[1:],
                 )
+                non_spec_query_start_loc_cpu = non_spec_cpu_buf
 
             assert num_accepted_tokens is not None
             num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]

@@ -292,7 +292,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             query_start_loc=new_query_start_loc,
             seq_lens=effective_seq_lens + num_query_per_req,
             query_start_loc_cpu=(
-                torch.from_numpy(self.token_arange_np[: batch_size + 1]).clone()
+                torch.from_numpy(self.token_arange_np[: batch_size + 1])
                 * num_query_per_req
             ),
             _seq_lens_cpu=None,

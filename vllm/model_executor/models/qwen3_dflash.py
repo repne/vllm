@@ -395,6 +395,8 @@ class DFlashQwen3Model(nn.Module):
         # RoPE parameters
         self._rope_head_size = attn0.rotary_emb.head_size
         self._rope_cos_sin_cache = attn0.rotary_emb.cos_sin_cache
+        self._rope_cos_sin_cache_cached: torch.Tensor | None = None
+        self._rope_cos_sin_cache_dtype: torch.dtype | None = None
         self._rope_is_neox = attn0.rotary_emb.is_neox_style
         # Validation that RoPE params are the same across all layers
         for attn in layers_attn[1:]:
@@ -488,8 +490,14 @@ class DFlashQwen3Model(nn.Module):
         all_k_flat = all_k_normed.view(L * num_ctx, kv)
         positions_repeated = context_positions.repeat(L)
         cos_sin_cache = self._rope_cos_sin_cache
-        if cos_sin_cache.dtype != all_k_flat.dtype:
-            cos_sin_cache = cos_sin_cache.to(dtype=all_k_flat.dtype)
+        if torch.compiler.is_compiling():
+            cos_sin_cache = self._rope_cos_sin_cache.to(dtype=all_k_flat.dtype)
+        else:
+            if self._rope_cos_sin_cache_dtype != all_k_flat.dtype:
+                self._rope_cos_sin_cache_cached = cos_sin_cache.to(dtype=all_k_flat.dtype)
+                self._rope_cos_sin_cache_dtype = all_k_flat.dtype
+            cos_sin_cache = self._rope_cos_sin_cache_cached
+            assert cos_sin_cache is not None
         ops.rotary_embedding(
             positions_repeated,
             all_k_flat,

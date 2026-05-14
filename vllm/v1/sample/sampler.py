@@ -88,7 +88,8 @@ class Sampler(nn.Module):
                     raw_logprobs = logits.to(torch.float32)
 
         # Use float32 for the logits.
-        logits = logits.to(torch.float32)
+        if logits.dtype != torch.float32:
+            logits = logits.to(torch.float32)
 
         logits = self.apply_logits_processors(
             logits, sampling_metadata, predict_bonus_token
