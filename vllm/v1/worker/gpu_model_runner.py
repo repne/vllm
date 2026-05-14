@@ -5181,7 +5181,7 @@ class GPUModelRunner(
         if not layer_ids:
             dflash_config = getattr(hf_config, "dflash_config", None)
             if dflash_config and isinstance(dflash_config, dict):
-                # Add 1 to convert DFlash's aux layer id semantics.
+                # Add 1 to convert DFlash's aux layer id semantics
                 layer_ids = [i + 1 for i in dflash_config.get("target_layer_ids", [])]
 
         if layer_ids and isinstance(layer_ids, (list, tuple)):

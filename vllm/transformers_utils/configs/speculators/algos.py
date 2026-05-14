@@ -104,6 +104,7 @@ def update_dflash(config_dict: dict, pre_trained_config: dict) -> None:
         if key in config_dict:
             pre_trained_config[key] = config_dict[key]
 
+    # TODO: does this need to be shifted by 1 like in gpu_model_runner?
     aux_layer_ids = config_dict["aux_hidden_state_layer_ids"]
     pre_trained_config["eagle_aux_hidden_state_layer_ids"] = [
         i + 1 for i in aux_layer_ids
