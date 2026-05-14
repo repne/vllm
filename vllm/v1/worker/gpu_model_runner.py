@@ -6570,6 +6570,7 @@ class GPUModelRunner(
         class AttentionGroupKey(NamedTuple):
             attn_backend: type[AttentionBackend]
             kv_cache_spec: KVCacheSpec
+            flashinfer_params: tuple[int, float | None, float, bool] | None
 
         def get_attn_backends_for_group(
             kv_cache_group_spec: KVCacheGroupSpec,
@@ -6598,9 +6599,20 @@ class GPUModelRunner(
                 layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
                 if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
                     layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
-                key = (full_cls_name, layer_kv_cache_spec)
+                flashinfer_params = None
+                if attn_backend.get_name() == "FLASHINFER":
+                    impl = layers[layer_name].impl
+                    window_size = getattr(impl, "sliding_window", None)
+                    window_left = window_size[0] if window_size is not None else -1
+                    flashinfer_params = (
+                        window_left,
+                        getattr(impl, "logits_soft_cap", None),
+                        impl.scale,
+                        getattr(impl, "sinks", None) is not None,
+                    )
+                key = (full_cls_name, layer_kv_cache_spec, flashinfer_params)
                 attn_backends[key] = AttentionGroupKey(
-                    attn_backend, layer_kv_cache_spec
+                    attn_backend, layer_kv_cache_spec, flashinfer_params
                 )
                 attn_backend_layers[key].append(layer_name)
             return (
@@ -6613,7 +6625,11 @@ class GPUModelRunner(
             kv_cache_group_id: int,
         ) -> list[AttentionGroup]:
             attn_groups: list[AttentionGroup] = []
-            for (attn_backend, kv_cache_spec), layer_names in attn_backends_map.items():
+            for (
+                attn_backend,
+                kv_cache_spec,
+                _flashinfer_params,
+            ), layer_names in attn_backends_map.items():
                 attn_group = AttentionGroup(
                     attn_backend,
                     layer_names,

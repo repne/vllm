@@ -120,7 +120,8 @@ class SpecDecodeBaseProposer:
 
         self.max_batch_size = vllm_config.scheduler_config.max_num_seqs
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-        self.token_arange_np = np.arange(self.max_num_tokens)
+        # FlashInfer plan() needs int32 indptr buffers.
+        self.token_arange_np = np.arange(self.max_num_tokens, dtype=np.int32)
 
         # Can be specialized by methods like DFlash to reduce the limit
         self.max_query_tokens = self.max_num_tokens
@@ -1735,8 +1736,14 @@ class SpecDecodeBaseProposer:
             )
         self.kv_cache_gid = self._draft_kv_cache_group_ids[0]
 
+        # Group draft layers by backend and (for FlashInfer only) sliding-window
+        # geometry. FlashInfer's metadata builder requires a single `window_left`
+        # per group; hybrid models (e.g. DFlash with both full and
+        # sliding_attention layers) must not merge layers with different
+        # `window_left` into one FlashInfer group.
         attention_groups: dict[
-            tuple[int, tuple[str, str], KVCacheSpec], AttentionGroup
+            tuple[int, str, KVCacheSpec, tuple[int, float | None, float, bool] | None],
+            AttentionGroup,
         ] = {}
         for layer_name in self._draft_attn_layer_names:
             gid = self._draft_layer_to_kv_cache_gid[layer_name]
@@ -1745,9 +1752,21 @@ class SpecDecodeBaseProposer:
             if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
                 layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
 
-            attn_backend = all_attn_layers[layer_name].get_attn_backend()
+            layer = all_attn_layers[layer_name]
+            attn_backend = layer.get_attn_backend()
             backend_key = attn_backend.full_cls_name()
-            group_key = (gid, backend_key, layer_kv_cache_spec)
+            flashinfer_params = None
+            if attn_backend.get_name() == "FLASHINFER":
+                impl = layer.impl
+                window_size = getattr(impl, "sliding_window", None)
+                window_left = window_size[0] if window_size is not None else -1
+                flashinfer_params = (
+                    window_left,
+                    getattr(impl, "logits_soft_cap", None),
+                    impl.scale,
+                    getattr(impl, "sinks", None) is not None,
+                )
+            group_key = (gid, backend_key, layer_kv_cache_spec, flashinfer_params)
             if group_key not in attention_groups:
                 kernel_block_size = (
                     kernel_block_sizes[gid]

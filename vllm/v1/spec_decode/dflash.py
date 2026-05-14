@@ -106,7 +106,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         kv_cache_gid: int,
         block_table: torch.Tensor,
     ) -> None:
-        if kv_cache_gid in self._draft_kv_cache_group_ids:
+        if kv_cache_gid in self._draft_kv_gids():
             self._draft_block_tables[kv_cache_gid] = block_table
 
     @override
@@ -127,10 +127,9 @@ class DFlashProposer(SpecDecodeBaseProposer):
         pass
 
     def _ensure_slot_mapping_buffers(self) -> None:
-        gids = self._draft_kv_gids()
-
-        first_gid = gids[0]
-        for gid in gids:
+        draft_kv_gids = self._draft_kv_gids()
+        first_gid = draft_kv_gids[0]
+        for gid in draft_kv_gids:
             if gid in self._slot_mapping_buffers_by_gid:
                 continue
             if gid == first_gid:
@@ -396,6 +395,25 @@ class DFlashProposer(SpecDecodeBaseProposer):
     def build_per_group_and_layer_attn_metadata(
         self, cad: CommonAttentionMetadata, draft_index: int = 0
     ) -> tuple[list[object], dict[str, object]]:
+        def build_for_layers(attn_group, layer_names, metadata_cad):
+            if set(layer_names) == set(attn_group.layer_names):
+                builder = attn_group.get_metadata_builder()
+            else:
+                # Some backends, notably FlashInfer, infer global planning
+                # parameters from the builder's layer_names. Mixed DFlash
+                # groups need subset builders so full and SWA layers do not
+                # share one `window_left` check.
+                base_builder = attn_group.get_metadata_builder()
+                builder = attn_group.backend.get_builder_cls()(
+                    base_builder.kv_cache_spec,
+                    layer_names,
+                    self.vllm_config,
+                    self.device,
+                )
+            return builder.build_for_drafting(
+                common_attn_metadata=metadata_cad,
+                draft_index=draft_index,
+            )
         self._ensure_slot_mapping_buffers()
         sliding_layer_names: set[str] = getattr(
             self.model, "sliding_attention_layer_names", set()
@@ -412,28 +430,41 @@ class DFlashProposer(SpecDecodeBaseProposer):
                 ],
                 causal=False,
             )
-            attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
-                common_attn_metadata=group_cad,
-                draft_index=draft_index,
-            )
-            per_group.append(attn_metadata)
-            for layer_name in attn_group.layer_names:
-                per_layer[layer_name] = attn_metadata
+            group_layer_names = set(attn_group.layer_names)
+            sliding_layers = sliding_layer_names & group_layer_names
+            full_layers = group_layer_names - sliding_layer_names
 
-            # DFlash layers consume attention metadata through the per-layer
-            # forward context. Keep the non-causal group metadata for
-            # group-level spec decode checks, and specialize only the SWA
-            # layers that need a causal sliding-window mask.
-            causal_layers = sliding_layer_names & set(attn_group.layer_names)
-            if causal_layers:
-                causal_attn_metadata = (
-                    attn_group.get_metadata_builder().build_for_drafting(
-                        common_attn_metadata=group_cad.replace(causal=True),
-                        draft_index=draft_index,
-                    )
+            # FlashAttention may group full and sliding-window DFlash layers
+            # together. Keep the group-level metadata non-causal for full
+            # layers, then override SWA layers below with causal metadata.
+            if full_layers or not sliding_layers:
+                full_layer_names = [
+                    name
+                    for name in attn_group.layer_names
+                    if name in full_layers or not sliding_layers
+                ]
+                attn_metadata = build_for_layers(
+                    attn_group,
+                    full_layer_names,
+                    group_cad,
                 )
-                for layer_name in causal_layers:
-                    per_layer[layer_name] = causal_attn_metadata
+                per_group.append(attn_metadata)
+                for layer_name in full_layer_names:
+                    per_layer[layer_name] = attn_metadata
+
+            if sliding_layers:
+                sliding_layer_names_in_group = [
+                    name for name in attn_group.layer_names if name in sliding_layers
+                ]
+                attn_metadata = build_for_layers(
+                    attn_group,
+                    sliding_layer_names_in_group,
+                    group_cad.replace(causal=True),
+                )
+                if not full_layers:
+                    per_group.append(attn_metadata)
+                for layer_name in sliding_layer_names_in_group:
+                    per_layer[layer_name] = attn_metadata
 
         for layer_name, attn_metadata in per_layer.items():
             if layer_name in sliding_layer_names:
