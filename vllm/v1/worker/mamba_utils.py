@@ -135,8 +135,10 @@ def postprocess_mamba_fused_kernel(
         ) * state_inner_size
         copy_size = num_elems_to_copy * state_elem_size
     else:
-        # Temporal state: copy from state[src_block_id + accept_token_bias]
-        # to state[dest_block_id]
+        # Temporal state: copy
+        #   state[block_table[req_idx, src_block_idx + accept_token_bias]]
+        # to
+        #   state[block_table[req_idx, dest_block_idx]]
         actual_src_block_idx = src_block_idx + accept_token_bias
         actual_src_block_id = tl.load(block_table_base + actual_src_block_idx).to(
             tl.int64
