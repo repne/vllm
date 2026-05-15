@@ -135,8 +135,10 @@ def postprocess_mamba_fused_kernel(
         ) * state_inner_size
         copy_size = num_elems_to_copy * state_elem_size
     else:
-        # Temporal state: copy from state[src_block_id + accept_token_bias]
-        # to state[dest_block_id]
+        # Temporal state: copy
+        #   state[block_table[req_idx, src_block_idx + accept_token_bias]]
+        # to
+        #   state[block_table[req_idx, dest_block_idx]]
         actual_src_block_idx = src_block_idx + accept_token_bias
         actual_src_block_id = tl.load(block_table_base + actual_src_block_idx).to(
             tl.int64
@@ -736,6 +738,95 @@ def can_skip_mamba_postprocess(
     return True
 
 
+def postprocess_mamba_gpu(
+    *,
+    bufs: "MambaBuffers",
+    num_reqs: int,
+    num_accepted_tokens_gpu: torch.Tensor,
+    mamba_state_idx_gpu: torch.Tensor,
+    num_scheduled_tokens_gpu: torch.Tensor,
+    num_computed_tokens_gpu: torch.Tensor,
+    num_draft_tokens_gpu: torch.Tensor,
+    num_accepted_tokens_cpu_tensor: torch.Tensor,
+    input_batch: GPUInputBatch,
+    kv_cache_config: KVCacheConfig,
+    forward_context: dict[str, Any],
+    mamba_state_copy_funcs: tuple[MambaStateCopyFunc, ...],
+) -> None:
+    """GPU-side mamba postprocess for spec decode + hybrid + align mode.
+
+    Lazily binds the fused-kernel context to the persistent block tables and
+    forward-context state pointers on the first call, runs the fused kernel,
+    and async-copies the per-request accepted-token counts back to the input
+    batch's CPU tensor for the next iteration's preprocess.
+    """
+    ctx = bufs.postprocess
+    # Caller is responsible for gating on spec decode + hybrid; this assert is
+    # a tripwire if those gates ever drift apart.
+    assert ctx is not None
+
+    if not ctx.is_initialized:
+        ctx.initialize_from_forward_context(
+            kv_cache_config,
+            forward_context,
+            mamba_state_copy_funcs,
+            [
+                input_batch.block_table[gid].get_device_tensor(num_reqs)
+                for gid in ctx.mamba_group_ids
+            ],
+        )
+
+    ctx.run_fused_postprocess(
+        num_reqs=num_reqs,
+        num_accepted_tokens_gpu=num_accepted_tokens_gpu,
+        mamba_state_idx_gpu=mamba_state_idx_gpu,
+        num_scheduled_tokens_gpu=num_scheduled_tokens_gpu,
+        num_computed_tokens_gpu=num_computed_tokens_gpu,
+        num_draft_tokens_gpu=num_draft_tokens_gpu,
+    )
+
+    # ``num_accepted_tokens_out`` is pre-initialized from
+    # ``num_accepted_tokens_gpu``; the kernel only overwrites entries to 1
+    # when src_block_idx == dest_block_idx (copy within the same block), so
+    # the original count is preserved for everyone else.
+    num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+        ctx.num_accepted_tokens_out[:num_reqs], non_blocking=True
+    )
+
+
+def stage_postprocess_metadata_to_gpu(
+    scheduler_output: SchedulerOutput,
+    req_ids: list[str],
+    num_reqs: int,
+    requests: dict[str, CachedRequestState],
+    num_scheduled_tokens_buf: CpuGpuBuffer,
+    num_computed_tokens_buf: CpuGpuBuffer,
+    num_draft_tokens_buf: CpuGpuBuffer,
+) -> None:
+    """Stage per-request postprocess metadata into GPU buffers (non-blocking).
+
+    Walks ``req_ids[:num_reqs]`` in batch order and writes each request's
+    scheduled/computed/draft token counts into the matching pinned numpy
+    views, then issues three non-blocking H→D copies. These values don't
+    change between ``_prepare_inputs`` and ``_update_states_after_model_execute``,
+    so staging here is safe. The fused postprocess kernel indexes the
+    resulting GPU tensors by ``req_idx``.
+    """
+    scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+    num_scheduled = scheduler_output.num_scheduled_tokens
+    scheduled_np = num_scheduled_tokens_buf.np
+    computed_np = num_computed_tokens_buf.np
+    draft_np = num_draft_tokens_buf.np
+    for i in range(num_reqs):
+        req_id = req_ids[i]
+        scheduled_np[i] = num_scheduled[req_id]
+        computed_np[i] = requests[req_id].num_computed_tokens
+        draft_np[i] = len(scheduled_spec_tokens.get(req_id, []))
+    num_scheduled_tokens_buf.copy_to_gpu(num_reqs)
+    num_computed_tokens_buf.copy_to_gpu(num_reqs)
+    num_draft_tokens_buf.copy_to_gpu(num_reqs)
+
+
 def stage_mamba_state_idx_to_gpu(
     mamba_state_idx: dict[str, int],
     req_ids: list[str],
@@ -761,3 +852,37 @@ def stage_mamba_state_idx_to_gpu(
         )
         np_view[i] = state_idx
     gpu_buf.copy_to_gpu(num_reqs)
+
+
+def stage_postprocess_inputs_to_gpu(
+    scheduler_output: SchedulerOutput,
+    req_ids: list[str],
+    num_reqs: int,
+    requests: dict[str, CachedRequestState],
+    mamba_state_idx: dict[str, int],
+    mamba_state_idx_buf: CpuGpuBuffer,
+    num_scheduled_tokens_buf: CpuGpuBuffer,
+    num_computed_tokens_buf: CpuGpuBuffer,
+    num_draft_tokens_buf: CpuGpuBuffer,
+) -> None:
+    """Stage all per-request inputs the fused mamba postprocess kernel reads.
+
+    Bundles ``stage_mamba_state_idx_to_gpu`` and
+    ``stage_postprocess_metadata_to_gpu`` into a single call so the runner
+    has one entry point for postprocess staging.
+    """
+    stage_mamba_state_idx_to_gpu(
+        mamba_state_idx,
+        req_ids,
+        num_reqs,
+        mamba_state_idx_buf,
+    )
+    stage_postprocess_metadata_to_gpu(
+        scheduler_output,
+        req_ids,
+        num_reqs,
+        requests,
+        num_scheduled_tokens_buf,
+        num_computed_tokens_buf,
+        num_draft_tokens_buf,
+    )
