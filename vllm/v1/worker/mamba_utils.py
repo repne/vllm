@@ -122,9 +122,10 @@ def postprocess_mamba_fused_kernel(
     is_conv_state = conv_width > 0
 
     if is_conv_state:
-        # Conv state: copy from state[src_block_id, accept_token_bias:] to
-        # state[dest_block_id] Source offset is accept_token_bias elements into
-        # the conv dimension
+        # Conv state: copy
+        #   state[block_table[req_idx, src_block_idx],  accept_token_bias:]
+        # to
+        #   state[block_table[req_idx, dest_block_idx], :conv_width - accept_token_bias]
         src_offset = accept_token_bias.to(tl.int64) * state_inner_size * state_elem_size
         src_addr = state_base_addr + src_block_id * state_block_stride + src_offset
         dst_addr = state_base_addr + dest_block_id * state_block_stride
