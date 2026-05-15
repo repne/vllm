@@ -1542,27 +1542,12 @@ class GPUModelRunner(
             # ever drift apart.
             assert ctx is not None
 
-            # Initialize metadata from forward_context if not done yet.
-            # Block-table base addresses / stride are captured once here too
-            # since input_batch.block_table.gpu is a persistent buffer.
-            if not ctx.is_initialized:
-                mamba_copy_funcs = self.model.get_mamba_state_copy_func()
-                ctx.initialize_from_forward_context(
-                    self.kv_cache_config,
-                    self.compilation_config.static_forward_context,
-                    mamba_copy_funcs,
-                    [
-                        self.input_batch.block_table[gid].get_device_tensor(num_reqs)
-                        for gid in ctx.mamba_group_ids
-                    ],
-                )
-
             # Fused GPU postprocess: state copies + per-request accepted-token
             # update without CPU-GPU sync. The metadata
             # (num_scheduled_tokens, num_draft_tokens, num_computed_tokens) is
             # pre-staged to GPU buffers in _prepare_inputs.
             mamba_utils.postprocess_mamba_gpu(
-                bufs=self._get_mamba_bufs(),
+                bufs=mamba_bufs,
                 num_reqs=num_reqs,
                 num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
                 mamba_state_idx_gpu=self.mamba_state_idx_buf.gpu,
@@ -1576,6 +1561,7 @@ class GPUModelRunner(
                 kv_cache_config=self.kv_cache_config,
                 forward_context=self.compilation_config.static_forward_context,
                 mamba_state_copy_funcs=self.model.get_mamba_state_copy_func(),
+                num_accepted_tokens_event=self.num_accepted_tokens_event,
             )
         else:
             # Simply copies the accepted token counts to CPU
@@ -1587,9 +1573,11 @@ class GPUModelRunner(
         # In both cases we do a non-blocking copy of results to CPU for next iteration's
         # preprocess (self.input_batch.num_accepted_tokens_cpu_tensor). So we need to
         # record the event for proper synchronization.
-        assert self.num_accepted_tokens_event is not None
-        self.num_accepted_tokens_event.record()
-
+        # (For the align+mamba path this is handled inside postprocess_mamba_gpu;
+        #  for the non-mamba path it's here.)
+        if self.cache_config.mamba_cache_mode != "align":
+            assert self.num_accepted_tokens_event is not None
+            self.num_accepted_tokens_event.record()
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
     ) -> CachedRequestState:

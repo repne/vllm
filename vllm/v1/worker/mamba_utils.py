@@ -753,6 +753,7 @@ def postprocess_mamba_gpu(
     kv_cache_config: KVCacheConfig,
     forward_context: dict[str, Any],
     mamba_state_copy_funcs: tuple[MambaStateCopyFunc, ...],
+    num_accepted_tokens_event: "torch.cuda.Event",
 ) -> None:
     """GPU-side mamba postprocess for spec decode + hybrid + align mode.
 
@@ -793,7 +794,9 @@ def postprocess_mamba_gpu(
     num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
         ctx.num_accepted_tokens_out[:num_reqs], non_blocking=True
     )
-
+    # Record on the same stream so the D2H copy is visible to anything
+    # that waits on this event (e.g. the next _prepare_inputs pass).
+    num_accepted_tokens_event.record()
 
 def stage_postprocess_metadata_to_gpu(
     scheduler_output: SchedulerOutput,
