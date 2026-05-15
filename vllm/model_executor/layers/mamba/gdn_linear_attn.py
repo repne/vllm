@@ -779,7 +779,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
+        core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
         output[:num_tokens], _ = self.out_proj(core_attn_out)
 
     def forward_hip(
@@ -947,7 +947,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
+        core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
         output[:num_tokens], _ = self.out_proj(core_attn_out)
 
     def forward_cpu(
@@ -997,7 +997,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
+        core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
         output[:num_tokens], _ = self.out_proj(core_attn_out)
 
     def _warmup_prefill_kernels(self, qkv_or_qkvz: torch.Tensor, v_dim: int) -> None:
