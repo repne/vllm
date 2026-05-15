@@ -1497,7 +1497,7 @@ class GPUModelRunner(
             return None
 
     def _update_states_after_model_execute(
-        self, output_token_ids: torch.Tensor
+        self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
     ) -> None:
         """Update the cached states after model execution.
 
@@ -1517,13 +1517,28 @@ class GPUModelRunner(
         self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
 
         if self.cache_config.mamba_cache_mode == "align":
-            # Uses GPU-based postprocessing via a fused kernel to handle mamba
-            # state copying without CPU-GPU synchronization. The required
-            # metadata (num_scheduled_tokens, num_draft_tokens,
-            # num_computed_tokens) is pre-synced to GPU buffers during
-            # _prepare_inputs
-
-            ctx = self._get_mamba_bufs().postprocess
+            # Skip the fused postprocess kernel launch when no request can
+            # cross a mamba block boundary. The predicate lives in mamba_utils
+            # next to `preprocess_mamba` so both stay updated in lockstep.
+            mamba_bufs = self._get_mamba_bufs()
+            if mamba_utils.can_skip_mamba_postprocess(
+                scheduler_output,
+                self.input_batch,
+                self.requests,
+                mamba_bufs.preprocess.mamba_spec.block_size,
+                num_reqs,
+            ):
+                # Async device-to-host copy; the event.synchronize() in
+                # `_prepare_inputs` (after the draft forwards) absorbs
+                # the wait. By then the GPU has long since finished the
+                # copy, so the synchronize is essentially free.
+                self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+                    self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
+                )
+                assert self.num_accepted_tokens_event is not None
+                self.num_accepted_tokens_event.record()
+                return
+            ctx = mamba_bufs.postprocess
             # ``ctx`` is allocated whenever spec decode + hybrid hold; the
             # outer ``_update_states_after_model_execute`` already early-returns
             # otherwise, so this assert is just a tripwire if those gates
@@ -4399,7 +4414,7 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
-        self._update_states_after_model_execute(sampler_output.sampled_token_ids)
+        self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
         if self.use_async_scheduling:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,

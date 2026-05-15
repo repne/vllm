@@ -684,6 +684,57 @@ def preprocess_mamba(
             input_batch.num_accepted_tokens_cpu[i] = 1
     do_mamba_copy_block(copy_bufs)
 
+def can_skip_mamba_postprocess(
+    scheduler_output: SchedulerOutput,
+    input_batch: GPUInputBatch,
+    requests: dict[str, CachedRequestState],
+    mamba_block_size: int,
+    num_reqs: int,
+) -> bool:
+    """Return True iff the fused postprocess kernel is provably a no-op.
+
+    The fused kernel (`postprocess_mamba_fused_kernel`) only mutates
+    state inside the per-thread conditional
+
+        aligned_new_computed >= num_tokens_running_state
+
+    where
+        num_tokens_running_state = num_computed + num_scheduled - num_draft
+        new_num_computed        = num_tokens_running_state + num_accepted - 1
+        aligned                 = (new_num_computed // block_size) * block_size
+
+    We do not know ``num_accepted`` without a GPU sync, but it is upper-
+    bounded by ``n_draft + 1`` for each request (drafts + the bonus
+    target token). If even the worst-case value cannot push any request
+    across a mamba block boundary, the kernel threads all early-return
+    and the caller can skip the launch entirely.
+
+    The check is per-request and uses only CPU-side state.
+
+    IMPORTANT: this predicate is logically coupled to the ``needs_copy``
+    conditional in :func:`postprocess_mamba_fused_kernel`. If that
+    conditional changes (different alignment policy, new boundary cases),
+    this predicate MUST be updated in lockstep.
+    """
+    if not mamba_block_size or mamba_block_size <= 0:
+        return False
+    num_scheduled = scheduler_output.num_scheduled_tokens
+    spec_decode = scheduler_output.scheduled_spec_decode_tokens
+    req_ids = input_batch.req_ids
+    for i in range(num_reqs):
+        req_id = req_ids[i]
+        req_state = requests[req_id]
+        n_draft = len(spec_decode.get(req_id, ()))
+        n_running = (
+            req_state.num_computed_tokens
+            + num_scheduled[req_id]
+            - n_draft
+        )
+        max_new_computed = n_running + n_draft
+        if (max_new_computed // mamba_block_size) * mamba_block_size >= n_running:
+            return False
+    return True
+
 
 def stage_mamba_state_idx_to_gpu(
     mamba_state_idx: dict[str, int],
