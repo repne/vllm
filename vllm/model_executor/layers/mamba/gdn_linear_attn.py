@@ -585,6 +585,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         _, ssm_state_dtype = self.get_state_dtype()
         self.gdn_decode_backend = _resolve_gdn_decode_backend(ssm_state_dtype)
 
+
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -1610,27 +1611,18 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             ssm_state: ``[pool_size, HV, V, K]``, dtype matches the
                 Mamba SSM cache dtype (bf16 or fp32 in supported cases).
             state_indices: ``[B]`` int32/int64 pool indices. vLLM uses
-                NULL_BLOCK_ID=0 to mark CUDAGraph-padded entries; we
-                remap those to -1 because that is FI's documented
-                "skip / null" sentinel for the pretranspose kernel
-                (Triton uses ``state_idx <= 0`` -> skip, FI uses
-                ``pool_idx < 0`` -> skip; pool slot 0 is a real slot
-                for FI). Without this remap, padded entries write
-                garbage state into pool slot 0 -> downstream illegal
-                memory access in subsequent steps.
+                NULL_BLOCK_ID=0 to mark CUDAGraph-padded entries; FlashInfer
+                kernels treat ``pool_idx <= 0`` as skip/padding, so indices
+                are passed through directly without remapping.
             out_bthv: pre-allocated ``[B, 1, HV, V]`` view of
                 ``core_attn_out`` to be written in place.
         """
         a = a_bhv.unsqueeze(1)
         b = b_bhv.unsqueeze(1)
 
-        # TODO: remove it when FI supports NULL_BLOCK_ID=0.
-        # Remap NULL_BLOCK_ID (=0) padding -> FI's -1 skip sentinel.
-        state_indices_fi = torch.where(
-            state_indices > 0,
-            state_indices,
-            torch.full_like(state_indices, -1),
-        )
+        # FlashInfer kernels now accept NULL_BLOCK_ID=0 as the padding sentinel
+        # (pool_idx > 0 processes, pool_idx <= 0 skips), so no remapping needed.
+        state_indices_fi = state_indices
 
         # NOTE: omit `output_state_indices` -- older flashinfer
         # releases (e.g. 0.6.8.post1) reject the kwarg, and the
