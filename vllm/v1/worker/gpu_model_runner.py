@@ -1494,7 +1494,7 @@ class GPUModelRunner(
             return None
 
     def _update_states_after_model_execute(
-        self, output_token_ids: torch.Tensor
+        self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
     ) -> None:
         """Update the cached states after model execution.
 
