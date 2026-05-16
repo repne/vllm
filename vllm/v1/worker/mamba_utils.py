@@ -812,9 +812,9 @@ def stage_postprocess_metadata_to_gpu(
     Walks ``req_ids[:num_reqs]`` in batch order and writes each request's
     scheduled/computed/draft token counts into the matching pinned numpy
     views, then issues three non-blocking H→D copies. These values don't
-    change between ``_prepare_inputs`` and ``_update_states_after_model_execute``,
-    so staging here is safe. The fused postprocess kernel indexes the
-    resulting GPU tensors by ``req_idx``.
+    change between ``_prepare_inputs`` and ``_update_states_after_model_execute``.
+    The fused postprocess kernel indexes the resulting GPU tensors
+    by ``req_idx``.
     """
     scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
     num_scheduled = scheduler_output.num_scheduled_tokens
