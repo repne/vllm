@@ -25,6 +25,12 @@ from vllm.v1.worker.mamba_utils import (
 
 MambaStateCopyFunc = Callable[..., Any]
 
+# Conv + temporal copy specs, in the order the tests' MambaSpec shapes expect.
+_COPY_FUNCS: tuple[MambaStateCopyFunc, ...] = (
+    get_conv_copy_spec,
+    get_temporal_copy_spec,
+)
+
 
 def postprocess_mamba(
     scheduler_output: "SchedulerOutput",
@@ -210,6 +216,75 @@ def _make_mock_attention(
     return attention
 
 
+def _make_dual_states(
+    cfg: "_TestConfig",
+    layer_names: list[str],
+    device: torch.device,
+    *,
+    num_blocks: int | None = None,
+) -> tuple[
+    list[torch.Tensor],
+    list[torch.Tensor],
+    list[torch.Tensor],
+    list[torch.Tensor],
+    dict[str, MagicMock],
+    dict[str, MagicMock],
+]:
+    """Allocate conv+temporal state tensors for the Python path, clone them for
+    the GPU path, and build matching ``forward_context`` dicts for both.
+
+    Returns ``(conv_py, temporal_py, conv_gpu, temporal_gpu, fwd_py, fwd_gpu)``
+    where the four state lists are parallel to ``layer_names``.
+    """
+    n_blocks = num_blocks if num_blocks is not None else cfg.num_blocks
+    conv_py = [
+        torch.randn(
+            n_blocks,
+            cfg.conv_width,
+            cfg.conv_inner_dim,
+            dtype=cfg.dtype,
+            device=device,
+        )
+        for _ in layer_names
+    ]
+    temporal_py = [
+        torch.randn(n_blocks, cfg.temporal_state_dim, dtype=cfg.dtype, device=device)
+        for _ in layer_names
+    ]
+    conv_gpu = [s.clone() for s in conv_py]
+    temporal_gpu = [s.clone() for s in temporal_py]
+    fwd_py = {
+        name: _make_mock_attention(c, t)
+        for name, c, t in zip(layer_names, conv_py, temporal_py)
+    }
+    fwd_gpu = {
+        name: _make_mock_attention(c, t)
+        for name, c, t in zip(layer_names, conv_gpu, temporal_gpu)
+    }
+    return conv_py, temporal_py, conv_gpu, temporal_gpu, fwd_py, fwd_gpu
+
+
+def _make_dual_layer_state(
+    cfg: "_TestConfig",
+    device: torch.device,
+    *,
+    num_blocks: int | None = None,
+    layer_name: str = "layer_0",
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    dict[str, MagicMock],
+    dict[str, MagicMock],
+]:
+    """Single-layer convenience form of ``_make_dual_states``."""
+    conv_py, temporal_py, conv_gpu, temporal_gpu, fwd_py, fwd_gpu = _make_dual_states(
+        cfg, [layer_name], device, num_blocks=num_blocks
+    )
+    return conv_py[0], temporal_py[0], conv_gpu[0], temporal_gpu[0], fwd_py, fwd_gpu
+
+
 def _make_kv_cache_config(cfg: _TestConfig, layer_names: list[str]) -> KVCacheConfig:
     """Create a KVCacheConfig with mamba groups."""
     mamba_spec = MambaSpec(
@@ -278,6 +353,58 @@ def _make_copy_bufs(
     )
 
 
+def _make_gpu_ctx(
+    cfg: _TestConfig, kv_cache_config: KVCacheConfig, device: torch.device
+) -> MambaSpecDecodeGPUContext:
+    """Create MambaSpecDecodeGPUContext for the GPU path."""
+
+    def make_buffer(n, dtype):
+        return _MockCpuGpuBuffer(n, dtype, device)
+
+    return MambaSpecDecodeGPUContext.create(
+        max_num_reqs=cfg.max_num_reqs,
+        kv_cache_config=kv_cache_config,
+        num_state_types=2,
+        device=device,
+        make_buffer=make_buffer,
+    )
+
+
+def _run_gpu_postprocess(
+    gpu_ctx: MambaSpecDecodeGPUContext,
+    *,
+    kv_cache_config: KVCacheConfig,
+    forward_context: dict[str, Any],
+    copy_funcs: tuple,
+    block_table: torch.Tensor,
+    req_ids: list[str],
+    num_accepted_tokens: list[int],
+    mamba_state_idx: list[int],
+    num_scheduled_tokens: dict[str, int],
+    num_computed_tokens: list[int],
+    num_draft_tokens: dict[str, int],
+    device: torch.device,
+) -> None:
+    """Initialize the GPU context against `block_table`, run the fused
+    postprocess kernel for `req_ids`, and synchronize."""
+
+    def t(values):
+        return torch.tensor(values, dtype=torch.int32, device=device)
+
+    gpu_ctx.initialize_from_forward_context(
+        kv_cache_config, forward_context, copy_funcs, [block_table]
+    )
+    gpu_ctx.run_fused_postprocess(
+        num_reqs=len(req_ids),
+        num_accepted_tokens_gpu=t(num_accepted_tokens),
+        mamba_state_idx_gpu=t(mamba_state_idx),
+        num_scheduled_tokens_gpu=t([num_scheduled_tokens[r] for r in req_ids]),
+        num_computed_tokens_gpu=t(num_computed_tokens),
+        num_draft_tokens_gpu=t([num_draft_tokens.get(r, 0) for r in req_ids]),
+    )
+    torch.accelerator.synchronize()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 class TestPostprocessMambaFusedKernel:
     """Tests for postprocess_mamba_fused_kernel comparing GPU vs CPU paths."""
@@ -333,40 +460,14 @@ class TestPostprocessMambaFusedKernel:
         layer_names = [f"layer_{i}" for i in range(cfg.num_layers)]
         kv_cache_config = _make_kv_cache_config(cfg, layer_names)
 
-        # Create state tensors - one set for Python, one for GPU
-        conv_states_py = [
-            torch.randn(
-                cfg.num_blocks,
-                cfg.conv_width,
-                cfg.conv_inner_dim,
-                dtype=cfg.dtype,
-                device=device,
-            )
-            for _ in range(cfg.num_layers)
-        ]
-        temporal_states_py = [
-            torch.randn(
-                cfg.num_blocks,
-                cfg.temporal_state_dim,
-                dtype=cfg.dtype,
-                device=device,
-            )
-            for _ in range(cfg.num_layers)
-        ]
-
-        # Clone for GPU path (deep copy before any modifications)
-        conv_states_gpu = [s.clone() for s in conv_states_py]
-        temporal_states_gpu = [s.clone() for s in temporal_states_py]
-
-        # Create forward_context for both paths
-        forward_context_py = {
-            name: _make_mock_attention(conv_states_py[i], temporal_states_py[i])
-            for i, name in enumerate(layer_names)
-        }
-        forward_context_gpu = {
-            name: _make_mock_attention(conv_states_gpu[i], temporal_states_gpu[i])
-            for i, name in enumerate(layer_names)
-        }
+        (
+            conv_states_py,
+            temporal_states_py,
+            conv_states_gpu,
+            temporal_states_gpu,
+            forward_context_py,
+            forward_context_gpu,
+        ) = _make_dual_states(cfg, layer_names, device)
 
         # --- Run Python path ---
         scheduler_output = _make_postprocess_scheduler_output(
@@ -379,7 +480,6 @@ class TestPostprocessMambaFusedKernel:
         )
         requests = _make_requests(req_ids, num_computed_tokens, block_ids_per_req)
         copy_bufs = _make_copy_bufs(cfg, kv_cache_config, device)
-        copy_funcs = (get_conv_copy_spec, get_temporal_copy_spec)
 
         postprocess_mamba(
             scheduler_output,
@@ -387,40 +487,15 @@ class TestPostprocessMambaFusedKernel:
             input_batch_py,
             requests,
             forward_context_py,
-            copy_funcs,
+            _COPY_FUNCS,
             copy_bufs,
         )
         torch.accelerator.synchronize()
 
         # --- Run GPU path ---
-        gpu_ctx = MambaSpecDecodeGPUContext.create(
-            max_num_reqs=cfg.max_num_reqs,
-            kv_cache_config=kv_cache_config,
-            num_state_types=2,  # conv + temporal
-            device=device,
-        )
+        gpu_ctx = _make_gpu_ctx(cfg, kv_cache_config, device)
 
-        # Build GPU input tensors
         num_reqs = len(req_ids)
-        num_accepted_tokens_gpu = torch.tensor(
-            num_accepted_tokens, dtype=torch.int32, device=device
-        )
-        mamba_state_idx_gpu = torch.tensor(
-            mamba_state_idx, dtype=torch.int32, device=device
-        )
-        num_scheduled_tokens_gpu = torch.tensor(
-            [num_scheduled_tokens[r] for r in req_ids], dtype=torch.int32, device=device
-        )
-        num_computed_tokens_gpu = torch.tensor(
-            num_computed_tokens, dtype=torch.int32, device=device
-        )
-        num_draft_tokens_gpu = torch.tensor(
-            [num_draft_tokens.get(r, 0) for r in req_ids],
-            dtype=torch.int32,
-            device=device,
-        )
-
-        # Build block table: [num_reqs, max_blocks]
         max_blocks = max(len(b) for b in block_ids_per_req)
         block_table_gpu = torch.zeros(
             num_reqs, max_blocks, dtype=torch.int32, device=device
@@ -429,19 +504,20 @@ class TestPostprocessMambaFusedKernel:
             block_table_gpu[i, : len(block_ids)] = torch.tensor(
                 block_ids, dtype=torch.int32
             )
-
-        gpu_ctx.initialize_from_forward_context(
-            kv_cache_config, forward_context_gpu, copy_funcs, [block_table_gpu]
+        _run_gpu_postprocess(
+            gpu_ctx,
+            kv_cache_config=kv_cache_config,
+            forward_context=forward_context_gpu,
+            copy_funcs=_COPY_FUNCS,
+            block_table=block_table_gpu,
+            req_ids=req_ids,
+            num_accepted_tokens=num_accepted_tokens,
+            mamba_state_idx=mamba_state_idx,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_computed_tokens=num_computed_tokens,
+            num_draft_tokens=num_draft_tokens,
+            device=device,
         )
-        gpu_ctx.run_fused_postprocess(
-            num_reqs=num_reqs,
-            num_accepted_tokens_gpu=num_accepted_tokens_gpu,
-            mamba_state_idx_gpu=mamba_state_idx_gpu,
-            num_scheduled_tokens_gpu=num_scheduled_tokens_gpu,
-            num_computed_tokens_gpu=num_computed_tokens_gpu,
-            num_draft_tokens_gpu=num_draft_tokens_gpu,
-        )
-        torch.accelerator.synchronize()
 
         # --- Compare results ---
         # 1. Compare state tensors
@@ -504,45 +580,27 @@ class TestPostprocessMambaFusedKernel:
         temporal_state_orig = temporal_state.clone()
 
         forward_context = {"layer_0": _make_mock_attention(conv_state, temporal_state)}
-        copy_funcs = (get_conv_copy_spec, get_temporal_copy_spec)
 
-        gpu_ctx = MambaSpecDecodeGPUContext.create(
-            max_num_reqs=cfg.max_num_reqs,
-            kv_cache_config=kv_cache_config,
-            num_state_types=2,
-            device=device,
-        )
+        gpu_ctx = _make_gpu_ctx(cfg, kv_cache_config, device)
 
         num_reqs = len(req_ids)
         block_table_gpu = torch.zeros(num_reqs, 8, dtype=torch.int32, device=device)
         block_table_gpu[0, :8] = torch.tensor(block_ids_per_req[0], dtype=torch.int32)
 
-        gpu_ctx.initialize_from_forward_context(
-            kv_cache_config, forward_context, copy_funcs, [block_table_gpu]
+        _run_gpu_postprocess(
+            gpu_ctx,
+            kv_cache_config=kv_cache_config,
+            forward_context=forward_context,
+            copy_funcs=_COPY_FUNCS,
+            block_table=block_table_gpu,
+            req_ids=req_ids,
+            num_accepted_tokens=num_accepted_tokens,
+            mamba_state_idx=mamba_state_idx,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_computed_tokens=num_computed_tokens,
+            num_draft_tokens=num_draft_tokens,
+            device=device,
         )
-        gpu_ctx.run_fused_postprocess(
-            num_reqs=num_reqs,
-            num_accepted_tokens_gpu=torch.tensor(
-                num_accepted_tokens, dtype=torch.int32, device=device
-            ),
-            mamba_state_idx_gpu=torch.tensor(
-                mamba_state_idx, dtype=torch.int32, device=device
-            ),
-            num_scheduled_tokens_gpu=torch.tensor(
-                [num_scheduled_tokens[r] for r in req_ids],
-                dtype=torch.int32,
-                device=device,
-            ),
-            num_computed_tokens_gpu=torch.tensor(
-                num_computed_tokens, dtype=torch.int32, device=device
-            ),
-            num_draft_tokens_gpu=torch.tensor(
-                [num_draft_tokens.get(r, 0) for r in req_ids],
-                dtype=torch.int32,
-                device=device,
-            ),
-        )
-        torch.accelerator.synchronize()
 
         # State should be unchanged
         torch.testing.assert_close(conv_state, conv_state_orig)
@@ -570,30 +628,15 @@ class TestPostprocessMambaFusedKernel:
 
         layer_names = ["layer_0"]
         kv_cache_config = _make_kv_cache_config(cfg, layer_names)
-        copy_funcs = (get_conv_copy_spec, get_temporal_copy_spec)
 
-        # Create states for Python path
-        conv_state_py = torch.randn(
-            total_blocks,
-            cfg.conv_width,
-            cfg.conv_inner_dim,
-            dtype=cfg.dtype,
-            device=device,
-        )
-        temporal_state_py = torch.randn(
-            total_blocks, cfg.temporal_state_dim, dtype=cfg.dtype, device=device
-        )
-
-        # Clone for GPU path
-        conv_state_gpu = conv_state_py.clone()
-        temporal_state_gpu = temporal_state_py.clone()
-
-        forward_context_py = {
-            "layer_0": _make_mock_attention(conv_state_py, temporal_state_py)
-        }
-        forward_context_gpu = {
-            "layer_0": _make_mock_attention(conv_state_gpu, temporal_state_gpu)
-        }
+        (
+            conv_state_py,
+            temporal_state_py,
+            conv_state_gpu,
+            temporal_state_gpu,
+            forward_context_py,
+            forward_context_gpu,
+        ) = _make_dual_layer_state(cfg, device)
 
         # Run Python path
         scheduler_output = _make_postprocess_scheduler_output(
@@ -613,18 +656,13 @@ class TestPostprocessMambaFusedKernel:
             input_batch_py,
             requests,
             forward_context_py,
-            copy_funcs,
+            _COPY_FUNCS,
             copy_bufs,
         )
         torch.accelerator.synchronize()
 
         # Run GPU path
-        gpu_ctx = MambaSpecDecodeGPUContext.create(
-            max_num_reqs=cfg.max_num_reqs,
-            kv_cache_config=kv_cache_config,
-            num_state_types=2,
-            device=device,
-        )
+        gpu_ctx = _make_gpu_ctx(cfg, kv_cache_config, device)
 
         max_blocks_per_req = 8
         block_table_gpu = torch.zeros(
@@ -635,32 +673,20 @@ class TestPostprocessMambaFusedKernel:
                 block_ids, dtype=torch.int32
             )
 
-        gpu_ctx.initialize_from_forward_context(
-            kv_cache_config, forward_context_gpu, copy_funcs, [block_table_gpu]
+        _run_gpu_postprocess(
+            gpu_ctx,
+            kv_cache_config=kv_cache_config,
+            forward_context=forward_context_gpu,
+            copy_funcs=_COPY_FUNCS,
+            block_table=block_table_gpu,
+            req_ids=req_ids,
+            num_accepted_tokens=num_accepted_tokens,
+            mamba_state_idx=mamba_state_idx,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_computed_tokens=num_computed_tokens,
+            num_draft_tokens=num_draft_tokens,
+            device=device,
         )
-        gpu_ctx.run_fused_postprocess(
-            num_reqs=num_reqs,
-            num_accepted_tokens_gpu=torch.tensor(
-                num_accepted_tokens, dtype=torch.int32, device=device
-            ),
-            mamba_state_idx_gpu=torch.tensor(
-                mamba_state_idx, dtype=torch.int32, device=device
-            ),
-            num_scheduled_tokens_gpu=torch.tensor(
-                [num_scheduled_tokens[r] for r in req_ids],
-                dtype=torch.int32,
-                device=device,
-            ),
-            num_computed_tokens_gpu=torch.tensor(
-                num_computed_tokens, dtype=torch.int32, device=device
-            ),
-            num_draft_tokens_gpu=torch.tensor(
-                [num_draft_tokens.get(r, 0) for r in req_ids],
-                dtype=torch.int32,
-                device=device,
-            ),
-        )
-        torch.accelerator.synchronize()
 
         # Compare results
         torch.testing.assert_close(
@@ -708,30 +734,15 @@ class TestPostprocessMambaFusedKernel:
 
         layer_names = ["layer_0"]
         kv_cache_config = _make_kv_cache_config(cfg, layer_names)
-        copy_funcs = (get_conv_copy_spec, get_temporal_copy_spec)
 
-        # Create states for Python path
-        conv_state_py = torch.randn(
-            total_blocks,
-            cfg.conv_width,
-            cfg.conv_inner_dim,
-            dtype=cfg.dtype,
-            device=device,
-        )
-        temporal_state_py = torch.randn(
-            total_blocks, cfg.temporal_state_dim, dtype=cfg.dtype, device=device
-        )
-
-        # Clone for GPU path
-        conv_state_gpu = conv_state_py.clone()
-        temporal_state_gpu = temporal_state_py.clone()
-
-        forward_context_py = {
-            "layer_0": _make_mock_attention(conv_state_py, temporal_state_py)
-        }
-        forward_context_gpu = {
-            "layer_0": _make_mock_attention(conv_state_gpu, temporal_state_gpu)
-        }
+        (
+            conv_state_py,
+            temporal_state_py,
+            conv_state_gpu,
+            temporal_state_gpu,
+            forward_context_py,
+            forward_context_gpu,
+        ) = _make_dual_layer_state(cfg, device)
 
         # Run Python path
         scheduler_output = _make_postprocess_scheduler_output(
@@ -751,18 +762,13 @@ class TestPostprocessMambaFusedKernel:
             input_batch_py,
             requests,
             forward_context_py,
-            copy_funcs,
+            _COPY_FUNCS,
             copy_bufs,
         )
         torch.accelerator.synchronize()
 
         # Run GPU path with REALISTIC block table stride
-        gpu_ctx = MambaSpecDecodeGPUContext.create(
-            max_num_reqs=cfg.max_num_reqs,
-            kv_cache_config=kv_cache_config,
-            num_state_types=2,
-            device=device,
-        )
+        gpu_ctx = _make_gpu_ctx(cfg, kv_cache_config, device)
 
         # KEY DIFFERENCE: Create a large block table like real code does
         # Real system has max_num_blocks_per_req >> blocks actually used
@@ -790,32 +796,20 @@ class TestPostprocessMambaFusedKernel:
             f"got {block_table_gpu.stride(0)}"
         )
 
-        gpu_ctx.initialize_from_forward_context(
-            kv_cache_config, forward_context_gpu, copy_funcs, [block_table_gpu]
+        _run_gpu_postprocess(
+            gpu_ctx,
+            kv_cache_config=kv_cache_config,
+            forward_context=forward_context_gpu,
+            copy_funcs=_COPY_FUNCS,
+            block_table=block_table_gpu,
+            req_ids=req_ids,
+            num_accepted_tokens=num_accepted_tokens,
+            mamba_state_idx=mamba_state_idx,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_computed_tokens=num_computed_tokens,
+            num_draft_tokens=num_draft_tokens,
+            device=device,
         )
-        gpu_ctx.run_fused_postprocess(
-            num_reqs=num_reqs,
-            num_accepted_tokens_gpu=torch.tensor(
-                num_accepted_tokens, dtype=torch.int32, device=device
-            ),
-            mamba_state_idx_gpu=torch.tensor(
-                mamba_state_idx, dtype=torch.int32, device=device
-            ),
-            num_scheduled_tokens_gpu=torch.tensor(
-                [num_scheduled_tokens[r] for r in req_ids],
-                dtype=torch.int32,
-                device=device,
-            ),
-            num_computed_tokens_gpu=torch.tensor(
-                num_computed_tokens, dtype=torch.int32, device=device
-            ),
-            num_draft_tokens_gpu=torch.tensor(
-                [num_draft_tokens.get(r, 0) for r in req_ids],
-                dtype=torch.int32,
-                device=device,
-            ),
-        )
-        torch.accelerator.synchronize()
 
         # Compare results - this will fail if stride handling is incorrect
         torch.testing.assert_close(
@@ -874,34 +868,19 @@ class TestPostprocessMambaFusedKernel:
 
         layer_names = ["layer_0"]
         kv_cache_config = _make_kv_cache_config(cfg, layer_names)
-        copy_funcs = (get_conv_copy_spec, get_temporal_copy_spec)
 
-        # Create state tensors for Python path
-        conv_state_py = torch.randn(
-            cfg.num_blocks,
-            cfg.conv_width,
-            cfg.conv_inner_dim,
-            dtype=cfg.dtype,
-            device=device,
-        )
-        temporal_state_py = torch.randn(
-            cfg.num_blocks, cfg.temporal_state_dim, dtype=cfg.dtype, device=device
-        )
-
-        # Clone for GPU path
-        conv_state_gpu = conv_state_py.clone()
-        temporal_state_gpu = temporal_state_py.clone()
+        (
+            conv_state_py,
+            temporal_state_py,
+            conv_state_gpu,
+            temporal_state_gpu,
+            forward_context_py,
+            forward_context_gpu,
+        ) = _make_dual_layer_state(cfg, device)
 
         # Also clone to verify no modification
         conv_state_orig = conv_state_py.clone()
         temporal_state_orig = temporal_state_py.clone()
-
-        forward_context_py = {
-            "layer_0": _make_mock_attention(conv_state_py, temporal_state_py)
-        }
-        forward_context_gpu = {
-            "layer_0": _make_mock_attention(conv_state_gpu, temporal_state_gpu)
-        }
 
         # --- Run Python path ---
         scheduler_output = _make_postprocess_scheduler_output(
@@ -921,49 +900,32 @@ class TestPostprocessMambaFusedKernel:
             input_batch_py,
             requests,
             forward_context_py,
-            copy_funcs,
+            _COPY_FUNCS,
             copy_bufs,
         )
         torch.accelerator.synchronize()
 
         # --- Run GPU path ---
-        gpu_ctx = MambaSpecDecodeGPUContext.create(
-            max_num_reqs=cfg.max_num_reqs,
-            kv_cache_config=kv_cache_config,
-            num_state_types=2,
-            device=device,
-        )
+        gpu_ctx = _make_gpu_ctx(cfg, kv_cache_config, device)
 
         num_reqs = len(req_ids)
         block_table_gpu = torch.zeros(num_reqs, 8, dtype=torch.int32, device=device)
         block_table_gpu[0, :8] = torch.tensor(block_ids_per_req[0], dtype=torch.int32)
 
-        gpu_ctx.initialize_from_forward_context(
-            kv_cache_config, forward_context_gpu, copy_funcs, [block_table_gpu]
+        _run_gpu_postprocess(
+            gpu_ctx,
+            kv_cache_config=kv_cache_config,
+            forward_context=forward_context_gpu,
+            copy_funcs=_COPY_FUNCS,
+            block_table=block_table_gpu,
+            req_ids=req_ids,
+            num_accepted_tokens=num_accepted_tokens,
+            mamba_state_idx=mamba_state_idx,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_computed_tokens=num_computed_tokens,
+            num_draft_tokens=num_draft_tokens,
+            device=device,
         )
-        gpu_ctx.run_fused_postprocess(
-            num_reqs=num_reqs,
-            num_accepted_tokens_gpu=torch.tensor(
-                num_accepted_tokens, dtype=torch.int32, device=device
-            ),
-            mamba_state_idx_gpu=torch.tensor(
-                mamba_state_idx, dtype=torch.int32, device=device
-            ),
-            num_scheduled_tokens_gpu=torch.tensor(
-                [num_scheduled_tokens[r] for r in req_ids],
-                dtype=torch.int32,
-                device=device,
-            ),
-            num_computed_tokens_gpu=torch.tensor(
-                num_computed_tokens, dtype=torch.int32, device=device
-            ),
-            num_draft_tokens_gpu=torch.tensor(
-                [num_draft_tokens.get(r, 0) for r in req_ids],
-                dtype=torch.int32,
-                device=device,
-            ),
-        )
-        torch.accelerator.synchronize()
 
         # --- Verify Python behavior (ground truth) ---
         # State should be unchanged (no copy when src_addr == dst_addr)
@@ -1047,34 +1009,19 @@ class TestPostprocessMambaFusedKernel:
 
         layer_names = ["layer_0"]
         kv_cache_config = _make_kv_cache_config(cfg, layer_names)
-        copy_funcs = (get_conv_copy_spec, get_temporal_copy_spec)
 
-        # Create state tensors for Python path
-        conv_state_py = torch.randn(
-            cfg.num_blocks,
-            cfg.conv_width,
-            cfg.conv_inner_dim,
-            dtype=cfg.dtype,
-            device=device,
-        )
-        temporal_state_py = torch.randn(
-            cfg.num_blocks, cfg.temporal_state_dim, dtype=cfg.dtype, device=device
-        )
-
-        # Clone for GPU path
-        conv_state_gpu = conv_state_py.clone()
-        temporal_state_gpu = temporal_state_py.clone()
+        (
+            conv_state_py,
+            temporal_state_py,
+            conv_state_gpu,
+            temporal_state_gpu,
+            forward_context_py,
+            forward_context_gpu,
+        ) = _make_dual_layer_state(cfg, device)
 
         # Clone to verify modification
         conv_state_orig = conv_state_py.clone()
         temporal_state_orig = temporal_state_py.clone()
-
-        forward_context_py = {
-            "layer_0": _make_mock_attention(conv_state_py, temporal_state_py)
-        }
-        forward_context_gpu = {
-            "layer_0": _make_mock_attention(conv_state_gpu, temporal_state_gpu)
-        }
 
         # --- Run Python path ---
         scheduler_output = _make_postprocess_scheduler_output(
@@ -1094,49 +1041,32 @@ class TestPostprocessMambaFusedKernel:
             input_batch_py,
             requests,
             forward_context_py,
-            copy_funcs,
+            _COPY_FUNCS,
             copy_bufs,
         )
         torch.accelerator.synchronize()
 
         # --- Run GPU path ---
-        gpu_ctx = MambaSpecDecodeGPUContext.create(
-            max_num_reqs=cfg.max_num_reqs,
-            kv_cache_config=kv_cache_config,
-            num_state_types=2,
-            device=device,
-        )
+        gpu_ctx = _make_gpu_ctx(cfg, kv_cache_config, device)
 
         num_reqs = len(req_ids)
         block_table_gpu = torch.zeros(num_reqs, 8, dtype=torch.int32, device=device)
         block_table_gpu[0, :8] = torch.tensor(block_ids_per_req[0], dtype=torch.int32)
 
-        gpu_ctx.initialize_from_forward_context(
-            kv_cache_config, forward_context_gpu, copy_funcs, [block_table_gpu]
+        _run_gpu_postprocess(
+            gpu_ctx,
+            kv_cache_config=kv_cache_config,
+            forward_context=forward_context_gpu,
+            copy_funcs=_COPY_FUNCS,
+            block_table=block_table_gpu,
+            req_ids=req_ids,
+            num_accepted_tokens=num_accepted_tokens,
+            mamba_state_idx=mamba_state_idx,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_computed_tokens=num_computed_tokens,
+            num_draft_tokens=num_draft_tokens,
+            device=device,
         )
-        gpu_ctx.run_fused_postprocess(
-            num_reqs=num_reqs,
-            num_accepted_tokens_gpu=torch.tensor(
-                num_accepted_tokens, dtype=torch.int32, device=device
-            ),
-            mamba_state_idx_gpu=torch.tensor(
-                mamba_state_idx, dtype=torch.int32, device=device
-            ),
-            num_scheduled_tokens_gpu=torch.tensor(
-                [num_scheduled_tokens[r] for r in req_ids],
-                dtype=torch.int32,
-                device=device,
-            ),
-            num_computed_tokens_gpu=torch.tensor(
-                num_computed_tokens, dtype=torch.int32, device=device
-            ),
-            num_draft_tokens_gpu=torch.tensor(
-                [num_draft_tokens.get(r, 0) for r in req_ids],
-                dtype=torch.int32,
-                device=device,
-            ),
-        )
-        torch.accelerator.synchronize()
 
         # --- Verify Python behavior (ground truth) ---
         dest_block_id = block_ids_per_req[0][1]  # dest_block_idx = 1
@@ -1224,33 +1154,18 @@ class TestPostprocessMambaFusedKernel:
 
         layer_names = ["layer_0"]
         kv_cache_config = _make_kv_cache_config(cfg, layer_names)
-        copy_funcs = (get_conv_copy_spec, get_temporal_copy_spec)
 
-        # Create state tensors for Python path
-        conv_state_py = torch.randn(
-            cfg.num_blocks,
-            cfg.conv_width,
-            cfg.conv_inner_dim,
-            dtype=cfg.dtype,
-            device=device,
-        )
-        temporal_state_py = torch.randn(
-            cfg.num_blocks, cfg.temporal_state_dim, dtype=cfg.dtype, device=device
-        )
-
-        # Clone for GPU path
-        conv_state_gpu = conv_state_py.clone()
-        temporal_state_gpu = temporal_state_py.clone()
+        (
+            conv_state_py,
+            temporal_state_py,
+            conv_state_gpu,
+            temporal_state_gpu,
+            forward_context_py,
+            forward_context_gpu,
+        ) = _make_dual_layer_state(cfg, device)
 
         # Clone to verify modification
         conv_state_orig = conv_state_py.clone()
-
-        forward_context_py = {
-            "layer_0": _make_mock_attention(conv_state_py, temporal_state_py)
-        }
-        forward_context_gpu = {
-            "layer_0": _make_mock_attention(conv_state_gpu, temporal_state_gpu)
-        }
 
         # --- Run Python path ---
         scheduler_output = _make_postprocess_scheduler_output(
@@ -1270,49 +1185,32 @@ class TestPostprocessMambaFusedKernel:
             input_batch_py,
             requests,
             forward_context_py,
-            copy_funcs,
+            _COPY_FUNCS,
             copy_bufs,
         )
         torch.accelerator.synchronize()
 
         # --- Run GPU path ---
-        gpu_ctx = MambaSpecDecodeGPUContext.create(
-            max_num_reqs=cfg.max_num_reqs,
-            kv_cache_config=kv_cache_config,
-            num_state_types=2,
-            device=device,
-        )
+        gpu_ctx = _make_gpu_ctx(cfg, kv_cache_config, device)
 
         num_reqs = len(req_ids)
         block_table_gpu = torch.zeros(num_reqs, 8, dtype=torch.int32, device=device)
         block_table_gpu[0, :8] = torch.tensor(block_ids_per_req[0], dtype=torch.int32)
 
-        gpu_ctx.initialize_from_forward_context(
-            kv_cache_config, forward_context_gpu, copy_funcs, [block_table_gpu]
+        _run_gpu_postprocess(
+            gpu_ctx,
+            kv_cache_config=kv_cache_config,
+            forward_context=forward_context_gpu,
+            copy_funcs=_COPY_FUNCS,
+            block_table=block_table_gpu,
+            req_ids=req_ids,
+            num_accepted_tokens=num_accepted_tokens,
+            mamba_state_idx=mamba_state_idx,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_computed_tokens=num_computed_tokens,
+            num_draft_tokens=num_draft_tokens,
+            device=device,
         )
-        gpu_ctx.run_fused_postprocess(
-            num_reqs=num_reqs,
-            num_accepted_tokens_gpu=torch.tensor(
-                num_accepted_tokens, dtype=torch.int32, device=device
-            ),
-            mamba_state_idx_gpu=torch.tensor(
-                mamba_state_idx, dtype=torch.int32, device=device
-            ),
-            num_scheduled_tokens_gpu=torch.tensor(
-                [num_scheduled_tokens[r] for r in req_ids],
-                dtype=torch.int32,
-                device=device,
-            ),
-            num_computed_tokens_gpu=torch.tensor(
-                num_computed_tokens, dtype=torch.int32, device=device
-            ),
-            num_draft_tokens_gpu=torch.tensor(
-                [num_draft_tokens.get(r, 0) for r in req_ids],
-                dtype=torch.int32,
-                device=device,
-            ),
-        )
-        torch.accelerator.synchronize()
 
         # --- Verify Python behavior (ground truth) ---
         dest_block_id = block_ids_per_req[0][3]  # dest_block_idx = 3
@@ -1389,31 +1287,18 @@ class TestPostprocessMambaFusedKernel:
 
         layer_names = ["layer_0"]
         kv_cache_config = _make_kv_cache_config(cfg, layer_names)
-        copy_funcs = (get_conv_copy_spec, get_temporal_copy_spec)
 
-        conv_state_py = torch.randn(
-            cfg.num_blocks,
-            cfg.conv_width,
-            cfg.conv_inner_dim,
-            dtype=cfg.dtype,
-            device=device,
-        )
-        temporal_state_py = torch.randn(
-            cfg.num_blocks, cfg.temporal_state_dim, dtype=cfg.dtype, device=device
-        )
-
-        conv_state_gpu = conv_state_py.clone()
-        temporal_state_gpu = temporal_state_py.clone()
+        (
+            conv_state_py,
+            temporal_state_py,
+            conv_state_gpu,
+            temporal_state_gpu,
+            forward_context_py,
+            forward_context_gpu,
+        ) = _make_dual_layer_state(cfg, device)
 
         conv_state_orig = conv_state_py.clone()
         temporal_state_orig = temporal_state_py.clone()
-
-        forward_context_py = {
-            "layer_0": _make_mock_attention(conv_state_py, temporal_state_py)
-        }
-        forward_context_gpu = {
-            "layer_0": _make_mock_attention(conv_state_gpu, temporal_state_gpu)
-        }
 
         # --- Run Python path ---
         scheduler_output = _make_postprocess_scheduler_output(
@@ -1433,49 +1318,31 @@ class TestPostprocessMambaFusedKernel:
             input_batch_py,
             requests,
             forward_context_py,
-            copy_funcs,
+            _COPY_FUNCS,
             copy_bufs,
         )
         torch.accelerator.synchronize()
 
         # --- Run GPU path ---
-        gpu_ctx = MambaSpecDecodeGPUContext.create(
-            max_num_reqs=cfg.max_num_reqs,
-            kv_cache_config=kv_cache_config,
-            num_state_types=2,
-            device=device,
-        )
+        gpu_ctx = _make_gpu_ctx(cfg, kv_cache_config, device)
         num_reqs = len(req_ids)
         block_table_gpu = torch.zeros(num_reqs, 8, dtype=torch.int32, device=device)
         block_table_gpu[0, :8] = torch.tensor(block_ids_per_req[0], dtype=torch.int32)
 
-        gpu_ctx.initialize_from_forward_context(
-            kv_cache_config, forward_context_gpu, copy_funcs, [block_table_gpu]
+        _run_gpu_postprocess(
+            gpu_ctx,
+            kv_cache_config=kv_cache_config,
+            forward_context=forward_context_gpu,
+            copy_funcs=_COPY_FUNCS,
+            block_table=block_table_gpu,
+            req_ids=req_ids,
+            num_accepted_tokens=num_accepted_tokens,
+            mamba_state_idx=mamba_state_idx,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_computed_tokens=num_computed_tokens,
+            num_draft_tokens=num_draft_tokens,
+            device=device,
         )
-
-        gpu_ctx.run_fused_postprocess(
-            num_reqs=num_reqs,
-            num_accepted_tokens_gpu=torch.tensor(
-                num_accepted_tokens, dtype=torch.int32, device=device
-            ),
-            mamba_state_idx_gpu=torch.tensor(
-                mamba_state_idx, dtype=torch.int32, device=device
-            ),
-            num_scheduled_tokens_gpu=torch.tensor(
-                [num_scheduled_tokens[r] for r in req_ids],
-                dtype=torch.int32,
-                device=device,
-            ),
-            num_computed_tokens_gpu=torch.tensor(
-                num_computed_tokens, dtype=torch.int32, device=device
-            ),
-            num_draft_tokens_gpu=torch.tensor(
-                [num_draft_tokens.get(r, 0) for r in req_ids],
-                dtype=torch.int32,
-                device=device,
-            ),
-        )
-        torch.accelerator.synchronize()
 
         # --- Verify Python behavior (ground truth) ---
         # Copy is self-to-self (same physical block), state unchanged
@@ -1577,37 +1444,15 @@ class TestPostprocessMambaFusedKernel:
         num_blocks = 50
         local_cfg = _TestConfig(num_blocks=num_blocks, max_num_reqs=cfg.max_num_reqs)
         kv_cache_config = _make_kv_cache_config(local_cfg, layer_names)
-        copy_funcs = (get_conv_copy_spec, get_temporal_copy_spec)
 
-        # Create state tensors
-        conv_states_py = [
-            torch.randn(
-                num_blocks,
-                cfg.conv_width,
-                cfg.conv_inner_dim,
-                dtype=cfg.dtype,
-                device=device,
-            )
-            for _ in range(cfg.num_layers)
-        ]
-        temporal_states_py = [
-            torch.randn(
-                num_blocks, cfg.temporal_state_dim, dtype=cfg.dtype, device=device
-            )
-            for _ in range(cfg.num_layers)
-        ]
-
-        conv_states_gpu = [s.clone() for s in conv_states_py]
-        temporal_states_gpu = [s.clone() for s in temporal_states_py]
-
-        forward_context_py = {
-            name: _make_mock_attention(conv_states_py[i], temporal_states_py[i])
-            for i, name in enumerate(layer_names)
-        }
-        forward_context_gpu = {
-            name: _make_mock_attention(conv_states_gpu[i], temporal_states_gpu[i])
-            for i, name in enumerate(layer_names)
-        }
+        (
+            conv_states_py,
+            temporal_states_py,
+            conv_states_gpu,
+            temporal_states_gpu,
+            forward_context_py,
+            forward_context_gpu,
+        ) = _make_dual_states(local_cfg, layer_names, device)
 
         # --- Run Python path ---
         scheduler_output = _make_postprocess_scheduler_output(
@@ -1627,18 +1472,13 @@ class TestPostprocessMambaFusedKernel:
             input_batch_py,
             requests,
             forward_context_py,
-            copy_funcs,
+            _COPY_FUNCS,
             copy_bufs,
         )
         torch.accelerator.synchronize()
 
         # --- Run GPU path ---
-        gpu_ctx = MambaSpecDecodeGPUContext.create(
-            max_num_reqs=local_cfg.max_num_reqs,
-            kv_cache_config=kv_cache_config,
-            num_state_types=2,
-            device=device,
-        )
+        gpu_ctx = _make_gpu_ctx(local_cfg, kv_cache_config, device)
         num_reqs = len(req_ids)
         max_blocks = max(len(b) for b in block_ids_per_req)
         block_table_gpu = torch.zeros(
@@ -1649,33 +1489,20 @@ class TestPostprocessMambaFusedKernel:
                 block_ids, dtype=torch.int32
             )
 
-        gpu_ctx.initialize_from_forward_context(
-            kv_cache_config, forward_context_gpu, copy_funcs, [block_table_gpu]
+        _run_gpu_postprocess(
+            gpu_ctx,
+            kv_cache_config=kv_cache_config,
+            forward_context=forward_context_gpu,
+            copy_funcs=_COPY_FUNCS,
+            block_table=block_table_gpu,
+            req_ids=req_ids,
+            num_accepted_tokens=num_accepted_tokens,
+            mamba_state_idx=mamba_state_idx,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_computed_tokens=num_computed_tokens,
+            num_draft_tokens=num_draft_tokens,
+            device=device,
         )
-
-        gpu_ctx.run_fused_postprocess(
-            num_reqs=num_reqs,
-            num_accepted_tokens_gpu=torch.tensor(
-                num_accepted_tokens, dtype=torch.int32, device=device
-            ),
-            mamba_state_idx_gpu=torch.tensor(
-                mamba_state_idx, dtype=torch.int32, device=device
-            ),
-            num_scheduled_tokens_gpu=torch.tensor(
-                [num_scheduled_tokens[r] for r in req_ids],
-                dtype=torch.int32,
-                device=device,
-            ),
-            num_computed_tokens_gpu=torch.tensor(
-                num_computed_tokens, dtype=torch.int32, device=device
-            ),
-            num_draft_tokens_gpu=torch.tensor(
-                [num_draft_tokens.get(r, 0) for r in req_ids],
-                dtype=torch.int32,
-                device=device,
-            ),
-        )
-        torch.accelerator.synchronize()
 
         # --- Compare results ---
         for i in range(cfg.num_layers):
@@ -1771,36 +1598,15 @@ class TestPostprocessMambaFusedKernel:
         num_blocks = 50
         local_cfg = _TestConfig(num_blocks=num_blocks, max_num_reqs=cfg.max_num_reqs)
         kv_cache_config = _make_kv_cache_config(local_cfg, layer_names)
-        copy_funcs = (get_conv_copy_spec, get_temporal_copy_spec)
 
-        conv_states_py = [
-            torch.randn(
-                num_blocks,
-                cfg.conv_width,
-                cfg.conv_inner_dim,
-                dtype=cfg.dtype,
-                device=device,
-            )
-            for _ in range(cfg.num_layers)
-        ]
-        temporal_states_py = [
-            torch.randn(
-                num_blocks, cfg.temporal_state_dim, dtype=cfg.dtype, device=device
-            )
-            for _ in range(cfg.num_layers)
-        ]
-
-        conv_states_gpu = [s.clone() for s in conv_states_py]
-        temporal_states_gpu = [s.clone() for s in temporal_states_py]
-
-        forward_context_py = {
-            name: _make_mock_attention(conv_states_py[i], temporal_states_py[i])
-            for i, name in enumerate(layer_names)
-        }
-        forward_context_gpu = {
-            name: _make_mock_attention(conv_states_gpu[i], temporal_states_gpu[i])
-            for i, name in enumerate(layer_names)
-        }
+        (
+            conv_states_py,
+            temporal_states_py,
+            conv_states_gpu,
+            temporal_states_gpu,
+            forward_context_py,
+            forward_context_gpu,
+        ) = _make_dual_states(local_cfg, layer_names, device)
 
         # --- Run Python path ---
         scheduler_output = _make_postprocess_scheduler_output(
@@ -1820,18 +1626,13 @@ class TestPostprocessMambaFusedKernel:
             input_batch_py,
             requests,
             forward_context_py,
-            copy_funcs,
+            _COPY_FUNCS,
             copy_bufs,
         )
         torch.accelerator.synchronize()
 
         # --- Run GPU path ---
-        gpu_ctx = MambaSpecDecodeGPUContext.create(
-            max_num_reqs=local_cfg.max_num_reqs,
-            kv_cache_config=kv_cache_config,
-            num_state_types=2,
-            device=device,
-        )
+        gpu_ctx = _make_gpu_ctx(local_cfg, kv_cache_config, device)
         num_reqs = len(req_ids)
         max_blocks = max(len(b) for b in block_ids_per_req)
         block_table_gpu = torch.zeros(
@@ -1842,33 +1643,20 @@ class TestPostprocessMambaFusedKernel:
                 block_ids, dtype=torch.int32
             )
 
-        gpu_ctx.initialize_from_forward_context(
-            kv_cache_config, forward_context_gpu, copy_funcs, [block_table_gpu]
+        _run_gpu_postprocess(
+            gpu_ctx,
+            kv_cache_config=kv_cache_config,
+            forward_context=forward_context_gpu,
+            copy_funcs=_COPY_FUNCS,
+            block_table=block_table_gpu,
+            req_ids=req_ids,
+            num_accepted_tokens=num_accepted_tokens,
+            mamba_state_idx=mamba_state_idx,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_computed_tokens=num_computed_tokens,
+            num_draft_tokens=num_draft_tokens,
+            device=device,
         )
-
-        gpu_ctx.run_fused_postprocess(
-            num_reqs=num_reqs,
-            num_accepted_tokens_gpu=torch.tensor(
-                num_accepted_tokens, dtype=torch.int32, device=device
-            ),
-            mamba_state_idx_gpu=torch.tensor(
-                mamba_state_idx, dtype=torch.int32, device=device
-            ),
-            num_scheduled_tokens_gpu=torch.tensor(
-                [num_scheduled_tokens[r] for r in req_ids],
-                dtype=torch.int32,
-                device=device,
-            ),
-            num_computed_tokens_gpu=torch.tensor(
-                num_computed_tokens, dtype=torch.int32, device=device
-            ),
-            num_draft_tokens_gpu=torch.tensor(
-                [num_draft_tokens.get(r, 0) for r in req_ids],
-                dtype=torch.int32,
-                device=device,
-            ),
-        )
-        torch.accelerator.synchronize()
 
         # --- Compare all state tensors ---
         for i in range(cfg.num_layers):
@@ -1958,27 +1746,15 @@ class TestPostprocessMambaFusedKernel:
 
         layer_names = ["layer_0"]
         kv_cache_config = _make_kv_cache_config(cfg, layer_names)
-        copy_funcs = (get_conv_copy_spec, get_temporal_copy_spec)
 
-        conv_state_py = torch.randn(
-            cfg.num_blocks,
-            cfg.conv_width,
-            cfg.conv_inner_dim,
-            dtype=cfg.dtype,
-            device=device,
-        )
-        temporal_state_py = torch.randn(
-            cfg.num_blocks, cfg.temporal_state_dim, dtype=cfg.dtype, device=device
-        )
-        conv_state_gpu = conv_state_py.clone()
-        temporal_state_gpu = temporal_state_py.clone()
-
-        forward_context_py = {
-            "layer_0": _make_mock_attention(conv_state_py, temporal_state_py)
-        }
-        forward_context_gpu = {
-            "layer_0": _make_mock_attention(conv_state_gpu, temporal_state_gpu)
-        }
+        (
+            conv_state_py,
+            temporal_state_py,
+            conv_state_gpu,
+            temporal_state_gpu,
+            forward_context_py,
+            forward_context_gpu,
+        ) = _make_dual_layer_state(cfg, device)
 
         # --- Run Python path ---
         scheduler_output = _make_postprocess_scheduler_output(
@@ -1998,7 +1774,7 @@ class TestPostprocessMambaFusedKernel:
             input_batch_py,
             requests,
             forward_context_py,
-            copy_funcs,
+            _COPY_FUNCS,
             copy_bufs,
         )
         torch.accelerator.synchronize()
@@ -2010,43 +1786,25 @@ class TestPostprocessMambaFusedKernel:
         )
 
         # --- Run GPU path ---
-        gpu_ctx = MambaSpecDecodeGPUContext.create(
-            max_num_reqs=cfg.max_num_reqs,
-            kv_cache_config=kv_cache_config,
-            num_state_types=2,
-            device=device,
-        )
+        gpu_ctx = _make_gpu_ctx(cfg, kv_cache_config, device)
         num_reqs = len(req_ids)
         block_table_gpu = torch.zeros(num_reqs, 8, dtype=torch.int32, device=device)
         block_table_gpu[0, :8] = torch.tensor(block_ids_per_req[0], dtype=torch.int32)
 
-        gpu_ctx.initialize_from_forward_context(
-            kv_cache_config, forward_context_gpu, copy_funcs, [block_table_gpu]
+        _run_gpu_postprocess(
+            gpu_ctx,
+            kv_cache_config=kv_cache_config,
+            forward_context=forward_context_gpu,
+            copy_funcs=_COPY_FUNCS,
+            block_table=block_table_gpu,
+            req_ids=req_ids,
+            num_accepted_tokens=num_accepted_tokens,
+            mamba_state_idx=mamba_state_idx,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_computed_tokens=num_computed_tokens,
+            num_draft_tokens=num_draft_tokens,
+            device=device,
         )
-
-        gpu_ctx.run_fused_postprocess(
-            num_reqs=num_reqs,
-            num_accepted_tokens_gpu=torch.tensor(
-                num_accepted_tokens, dtype=torch.int32, device=device
-            ),
-            mamba_state_idx_gpu=torch.tensor(
-                mamba_state_idx, dtype=torch.int32, device=device
-            ),
-            num_scheduled_tokens_gpu=torch.tensor(
-                [num_scheduled_tokens[r] for r in req_ids],
-                dtype=torch.int32,
-                device=device,
-            ),
-            num_computed_tokens_gpu=torch.tensor(
-                num_computed_tokens, dtype=torch.int32, device=device
-            ),
-            num_draft_tokens_gpu=torch.tensor(
-                [num_draft_tokens.get(r, 0) for r in req_ids],
-                dtype=torch.int32,
-                device=device,
-            ),
-        )
-        torch.accelerator.synchronize()
 
         # The critical assertion: kernel must NOT set num_accepted_tokens to 1
         # when src_block_idx != dest_block_idx, even though src_addr == dst_addr
@@ -2115,7 +1873,6 @@ class TestPostprocessMambaFusedKernel:
 
         layer_names = ["layer_0"]
         kv_cache_config = _make_kv_cache_config(cfg, layer_names)
-        copy_funcs = (get_conv_copy_spec, get_temporal_copy_spec)
 
         # --- Production-like packed layout (mirrors gpu_model_runner.py) ---
         conv_shape = (cfg.conv_width, cfg.conv_inner_dim)
@@ -2181,49 +1938,31 @@ class TestPostprocessMambaFusedKernel:
             batch_py,
             requests,
             fwd_py,
-            copy_funcs,
+            _COPY_FUNCS,
             copy_bufs,
         )
         torch.accelerator.synchronize()
 
         # --- GPU fused kernel ---
-        gpu_ctx = MambaSpecDecodeGPUContext.create(
-            max_num_reqs=cfg.max_num_reqs,
-            kv_cache_config=kv_cache_config,
-            num_state_types=2,
-            device=device,
-        )
+        gpu_ctx = _make_gpu_ctx(cfg, kv_cache_config, device)
         num_reqs = 1
         block_table = torch.zeros(num_reqs, 8, dtype=torch.int32, device=device)
         block_table[0, :8] = torch.tensor(block_ids_per_req[0], dtype=torch.int32)
 
-        gpu_ctx.initialize_from_forward_context(
-            kv_cache_config, fwd_gpu, copy_funcs, [block_table]
+        _run_gpu_postprocess(
+            gpu_ctx,
+            kv_cache_config=kv_cache_config,
+            forward_context=fwd_gpu,
+            copy_funcs=_COPY_FUNCS,
+            block_table=block_table,
+            req_ids=req_ids,
+            num_accepted_tokens=num_accepted_tokens,
+            mamba_state_idx=mamba_state_idx,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_computed_tokens=num_computed_tokens,
+            num_draft_tokens=num_draft_tokens,
+            device=device,
         )
-
-        gpu_ctx.run_fused_postprocess(
-            num_reqs=num_reqs,
-            num_accepted_tokens_gpu=torch.tensor(
-                num_accepted_tokens, dtype=torch.int32, device=device
-            ),
-            mamba_state_idx_gpu=torch.tensor(
-                mamba_state_idx, dtype=torch.int32, device=device
-            ),
-            num_scheduled_tokens_gpu=torch.tensor(
-                [num_scheduled_tokens[r] for r in req_ids],
-                dtype=torch.int32,
-                device=device,
-            ),
-            num_computed_tokens_gpu=torch.tensor(
-                num_computed_tokens, dtype=torch.int32, device=device
-            ),
-            num_draft_tokens_gpu=torch.tensor(
-                [num_draft_tokens.get(r, 0) for r in req_ids],
-                dtype=torch.int32,
-                device=device,
-            ),
-        )
-        torch.accelerator.synchronize()
 
         # --- Assertions ---
         # With the bug (pre-240723d46), the kernel copies page_size_bytes
@@ -2299,24 +2038,16 @@ class TestPostprocessMambaFusedKernel:
 
         layer_names = ["layer_0"]
         kv_cache_config = _make_kv_cache_config(cfg, layer_names)
-        copy_funcs = (get_conv_copy_spec, get_temporal_copy_spec)
 
-        conv_state_py = torch.randn(
-            cfg.num_blocks,
-            cfg.conv_width,
-            cfg.conv_inner_dim,
-            dtype=cfg.dtype,
-            device=device,
-        )
-        temporal_state_py = torch.randn(
-            cfg.num_blocks, cfg.temporal_state_dim, dtype=cfg.dtype, device=device
-        )
-        conv_state_gpu = conv_state_py.clone()
-        temporal_state_gpu = temporal_state_py.clone()
+        (
+            conv_state_py,
+            temporal_state_py,
+            conv_state_gpu,
+            temporal_state_gpu,
+            fwd_py,
+            fwd_gpu,
+        ) = _make_dual_layer_state(cfg, device)
         temporal_state_orig = temporal_state_py.clone()
-
-        fwd_py = {"layer_0": _make_mock_attention(conv_state_py, temporal_state_py)}
-        fwd_gpu = {"layer_0": _make_mock_attention(conv_state_gpu, temporal_state_gpu)}
 
         # --- Python reference ---
         sched = _make_postprocess_scheduler_output(
@@ -2336,49 +2067,31 @@ class TestPostprocessMambaFusedKernel:
             batch_py,
             requests,
             fwd_py,
-            copy_funcs,
+            _COPY_FUNCS,
             copy_bufs,
         )
         torch.accelerator.synchronize()
 
         # --- GPU fused kernel ---
-        gpu_ctx = MambaSpecDecodeGPUContext.create(
-            max_num_reqs=cfg.max_num_reqs,
-            kv_cache_config=kv_cache_config,
-            num_state_types=2,
-            device=device,
-        )
+        gpu_ctx = _make_gpu_ctx(cfg, kv_cache_config, device)
         num_reqs = 1
         block_table = torch.zeros(num_reqs, 8, dtype=torch.int32, device=device)
         block_table[0, :8] = torch.tensor(block_ids_per_req[0], dtype=torch.int32)
 
-        gpu_ctx.initialize_from_forward_context(
-            kv_cache_config, fwd_gpu, copy_funcs, [block_table]
+        _run_gpu_postprocess(
+            gpu_ctx,
+            kv_cache_config=kv_cache_config,
+            forward_context=fwd_gpu,
+            copy_funcs=_COPY_FUNCS,
+            block_table=block_table,
+            req_ids=req_ids,
+            num_accepted_tokens=num_accepted_tokens,
+            mamba_state_idx=mamba_state_idx,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_computed_tokens=num_computed_tokens,
+            num_draft_tokens=num_draft_tokens,
+            device=device,
         )
-
-        gpu_ctx.run_fused_postprocess(
-            num_reqs=num_reqs,
-            num_accepted_tokens_gpu=torch.tensor(
-                num_accepted_tokens, dtype=torch.int32, device=device
-            ),
-            mamba_state_idx_gpu=torch.tensor(
-                mamba_state_idx, dtype=torch.int32, device=device
-            ),
-            num_scheduled_tokens_gpu=torch.tensor(
-                [num_scheduled_tokens[r] for r in req_ids],
-                dtype=torch.int32,
-                device=device,
-            ),
-            num_computed_tokens_gpu=torch.tensor(
-                num_computed_tokens, dtype=torch.int32, device=device
-            ),
-            num_draft_tokens_gpu=torch.tensor(
-                [num_draft_tokens.get(r, 0) for r in req_ids],
-                dtype=torch.int32,
-                device=device,
-            ),
-        )
-        torch.accelerator.synchronize()
 
         # --- Ground truth: Python must have sourced temporal from block 3 ---
         actual_src_block_id = block_ids_per_req[0][3]  # == 3
