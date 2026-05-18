@@ -36,6 +36,9 @@ class ThinkingBudgetStateHolder:
     think_start_token_ids: list[int]
     think_end_token_ids: list[int]
 
+    think_canonical_end_token_ids: list[int]
+
+
     def __init__(
         self,
         reasoning_config: "ReasoningConfig | None",
@@ -55,11 +58,19 @@ class ThinkingBudgetStateHolder:
         if reasoning_config is None:
             self.think_start_token_ids = []
             self.think_end_token_ids = []
+
+            self.think_canonical_end_token_ids = []
+
         else:
             rs = reasoning_config.reasoning_start_token_ids
             re = reasoning_config.reasoning_end_token_ids
             self.think_start_token_ids = rs if rs else []
             self.think_end_token_ids = re if re else []
+            self.think_canonical_end_token_ids = (
+                getattr(reasoning_config, "reasoning_canonical_end_token_ids", None)
+                or []
+            )
+
 
         self.device = device
         self._state: dict[int, dict[str, Any]] = {}
@@ -144,12 +155,43 @@ class ThinkingBudgetStateHolder:
                 state["spec_token_ids"] = []
             state["in_spec_mode"] = self.in_spec_mode
             state["force_index"] = []
-            if len(state["output_tok_ids"]) > 0:
+            # Before stripping spec tokens, check for end tokens in the
+            # full output (including spec).  With MTP, the canonical end token
+            # may live in the spec region -- stripping it would hide the natural
+            # exit from _update_think_state and cause false budget exhaustion.
+            full_output = state["output_tok_ids"]
+            if len(full_output) > 0:
                 spec_len = len(state["spec_token_ids"])
-                # Only strip draft suffix when there are spec tokens; ``[:-0]`` would
-                # clear the whole list (Python treats stop index 0 as "up to empty").
-                if spec_len > 0 and len(state["output_tok_ids"]) >= spec_len:
-                    state["output_tok_ids"] = state["output_tok_ids"][:-spec_len]
+                if spec_len > 0 and len(full_output) >= spec_len:
+                    # Find end position in the full output BEFORE stripping.
+                    end_pos = self._find_last_sequence_index(
+                        full_output, self.think_end_token_ids
+                    )
+                    matched_end_seq_len = len(self.think_end_token_ids)
+                    if self.think_canonical_end_token_ids:
+                        canonical_pos = self._find_last_sequence_index(
+                            full_output, self.think_canonical_end_token_ids
+                        )
+                        if canonical_pos > end_pos:
+                            end_pos = canonical_pos
+                            matched_end_seq_len = len(
+                                self.think_canonical_end_token_ids
+                            )
+                    # If end token is inside the spec region, strip only the
+                    # tokens AFTER the end sequence so that
+                    # _update_think_state can still detect it.
+                    if end_pos >= 0:
+                        keep_through = end_pos + matched_end_seq_len  # exclusive
+                        # Preserve the end sequence even when it extends to the
+                        # very end of full_output (canonical end is final spec token).
+                        if keep_through >= 0:
+                            state["output_tok_ids"] = full_output[:keep_through]
+                            # Discard spec tokens after the preserved end.
+                            state["spec_token_ids"] = []
+                            self._update_think_state(state)
+                            continue
+                    # No end token in spec region -- strip as usual.
+                    state["output_tok_ids"] = full_output[:-spec_len]
             self._update_think_state(state)
 
     def apply_to_logits(
@@ -196,6 +238,15 @@ class ThinkingBudgetStateHolder:
             last_end = self._find_last_sequence_index(
                 prompt_tok_ids, self.think_end_token_ids
             )
+            # Also check for canonical end token (e.g. parser's default </thinking>)
+            # as an additional natural exit marker when the configured
+            # reasoning_end_token_ids is a longer custom sentence.
+            if self.think_canonical_end_token_ids:
+                last_canonical_end = self._find_last_sequence_index(
+                    prompt_tok_ids, self.think_canonical_end_token_ids
+                )
+                if last_canonical_end > last_end:
+                    last_end = last_canonical_end
             in_think = last_start > last_end
             # load metrics such as think count, start thinking
             # if request is in thinking mode, already
@@ -245,11 +296,23 @@ class ThinkingBudgetStateHolder:
                 state.get("output_tok_ids", []), self.think_start_token_ids
             )
             state["start_thinking"] = start_thinking
-        if state["end_thinking"] == -1:
-            end_thinking = self._find_last_sequence_index(
-                state.get("output_tok_ids", []), self.think_end_token_ids
+        # Always check for end tokens in the current output.
+        # The canonical end token may arrive after the initial check, so we
+        # re-check on every call.
+        end_thinking = self._find_last_sequence_index(
+            state.get("output_tok_ids", []), self.think_end_token_ids
+        )
+        # Also check for canonical end token (e.g. parser's default </thinking>)
+        # as an additional natural exit marker when the configured
+        # reasoning_end_token_ids is a longer custom sentence.
+        if self.think_canonical_end_token_ids:
+            canonical_end = self._find_last_sequence_index(
+                state.get("output_tok_ids", []),
+                self.think_canonical_end_token_ids,
             )
-            state["end_thinking"] = end_thinking
+            if canonical_end > end_thinking:
+                end_thinking = canonical_end
+        state["end_thinking"] = end_thinking
 
         if state["start_thinking"] == -1:
             return
@@ -273,10 +336,13 @@ class ThinkingBudgetStateHolder:
         predicted_countdown = current_step_countdown - len(state["spec_token_ids"]) - 1
         # We only proceed further if we have counted down the thinking budget
         # to 0 or less and when we are in the "in think" mode.
+        # Don't early-return if an end token has been detected
+        # (model naturally exited thinking via end/canonical end token).
         if (
             not state.get("in_end", False)
             and predicted_countdown >= 0
             and state["start_thinking"] > -1
+            and end_thinking == -1
         ):
             state["check_count_down"] = current_step_countdown
             state["prev_output_length"] = len(state.get("output_tok_ids", []))
@@ -313,7 +379,18 @@ class ThinkingBudgetStateHolder:
         state["prev_output_length"] = current_length
 
         start_len = len(self.think_start_token_ids)
+        # start_thinking is always an index into the space where output begins at 0.
+        # When continue_thinking=True, it points into the prompt (position > output
+        # length), which is correct — it acts as a virtual position before output
+        # tokens. No offset needed.
         absolute_start_pos = state["start_thinking"]
+        # end_thinking is an index into output_tok_ids, so offset it by prompt
+        # length to put it in the same space as absolute_start_pos.
+        # end_thinking is an index into output_tok_ids.  Only offset by prompt
+        # length when continue_thinking=True (start token lives in the prompt,
+        # so absolute_start_pos is already in global space).  When the start
+        # token is in output (non-continue case), both are output-space indices
+        # and need no offset.
 
         if state["continue_thinking"] and state["end_thinking"] > -1:
             absolute_end_pos = state["end_thinking"] + len(
@@ -331,6 +408,15 @@ class ThinkingBudgetStateHolder:
             stopping_thinking = (
                 self.think_end_token_ids[state["end_count"]] in new_tokens
             )
+            # Also check for canonical end token in new tokens.
+            # When the model naturally emits the canonical end (e.g. the
+            # parser's default closing tag) after a forced token was rejected,
+            # we should recognise it and not revert to think mode.
+            if not stopping_thinking and self.think_canonical_end_token_ids:
+                stopping_thinking = any(
+                    tid in new_tokens
+                    for tid in self.think_canonical_end_token_ids
+                )
             if not stopping_thinking:
                 state["in_think"] = True
                 state["in_end"] = False

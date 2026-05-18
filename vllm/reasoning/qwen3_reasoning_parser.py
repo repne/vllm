@@ -139,16 +139,19 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         result = super().extract_content_ids(input_ids)
         if result:
             return result
-        # Fall back: content starts at the FIRST <tool_call> 
+        # Fall back: content starts at the LAST <tool_call>
         # (implicit reasoning end).
         if (
             self._tool_call_token_id is not None
             and self._tool_call_token_id in input_ids
         ):
-            tool_call_index = input_ids.index(self._tool_call_token_id)
+            # Use LAST occurrence (reverse lookup) — with MTP or
+            # multi-tool responses there may be multiple <tool_call> tokens.
+            tool_call_index = (
+                len(input_ids) - 1 - input_ids[::-1].index(self._tool_call_token_id)
+            )
             return input_ids[tool_call_index:]
         return []
-
     def extract_reasoning(
         self, model_output: str, request: "ChatCompletionRequest | ResponsesRequest"
     ) -> tuple[str | None, str | None]:
@@ -232,32 +235,47 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
             if start_idx >= 0:
                 delta_text = delta_text[start_idx + len(self.start_token) :]
 
+        # Stop-string buffering can delay the visible text for </think> until a
+        # later chunk, so detect the end marker from text first rather than
+        # relying solely on the token ids from the current delta.
+        end_index = delta_text.find(self.end_token)
+        if end_index >= 0:
+            reasoning = delta_text[:end_index]
+            content = delta_text[end_index + len(self.end_token) :]
+            if not reasoning and not content:
+                return None
+            return DeltaMessage(
+                reasoning=reasoning if reasoning else None,
+                content=content if content else None,
+            )
+
         if self.end_token_id in delta_token_ids:
-            # End token in this delta: split reasoning from content.
-            end_index = delta_text.find(self.end_token)
-            if end_index >= 0:
-                reasoning = delta_text[:end_index]
-                content = delta_text[end_index + len(self.end_token) :]
-                if not reasoning and not content:
-                    return None
-                return DeltaMessage(
-                    reasoning=reasoning if reasoning else None,
-                    content=content if content else None,
-                )
-            # end_token_id in IDs but not in text (already stripped)
-            return None
+            if not delta_text:
+                # End token in IDs but text is fully empty -- wait for the
+                # detokenizer to flush the buffered text in a later chunk.
+                return None
+            # End token in IDs but text is non-empty and does NOT contain the
+            # end marker (checked above).  This means stop-string truncation
+            # removed the end token text.  Emit the remaining text as reasoning
+            # and let parse_delta's transition handle the tool-call hand-off.
+            return DeltaMessage(reasoning=delta_text)
+
 
         # No end token in this delta.
         if not delta_text:
             # Nothing left after stripping start token.
             return None
-        
+
+
         # If thinking already ended, everything is content.
-        if (self.end_token_id in previous_token_ids or 
-            (self._tool_call_token_id is not None and 
+        if (self.end_token_id in previous_token_ids or
+            self.end_token in previous_text or
+            (self._tool_call_token_id is not None and
              self._tool_call_token_id in previous_token_ids) or
-            (bool(self._tool_call_tag) and 
+            (bool(self._tool_call_tag) and
              self._tool_call_tag in previous_text)):
+            return DeltaMessage(content=delta_text)
+
             return DeltaMessage(content=delta_text)
 
         # Implicit reasoning end via <tool_call>.

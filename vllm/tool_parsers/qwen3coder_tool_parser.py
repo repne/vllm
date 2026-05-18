@@ -374,7 +374,7 @@ class Qwen3CoderToolParser(ToolParser):
             param_end = self._find_true_param_end(
                 after_func_open[value_start:],
                 valid_param_names,
-                require_lookahead=True,
+                require_lookahead=False,
             )
             if param_end == -1:
                 # Missing </parameter> malformation: try the next

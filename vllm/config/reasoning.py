@@ -36,6 +36,16 @@ class ReasoningConfig:
     )
     """Private backing field for `reasoning_end_token_ids`. Set by
     `initialize_token_ids`. Not intended to be configured directly."""
+    _reasoning_canonical_end_token_ids: list[int] | None = field(
+        default=None, init=False, repr=False
+    )
+    """Private backing field for `reasoning_canonical_end_token_ids`. Set by
+    `initialize_token_ids` to the tokenization of the reasoning parser's own
+    default end string (e.g. ``"</think>"``). This lets consumers recognize a
+    naturally emitted end-of-thinking marker even when the user configures a
+    longer custom ``reasoning_end_str``. Not intended to be configured
+    directly."""
+
 
     _enabled: bool = field(default=False, init=False, repr=False)
     """Private field indicating whether reasoning token IDs have been initialized.
@@ -59,6 +69,15 @@ class ReasoningConfig:
         `initialize_token_ids`. Not intended to be configured directly."""
         return self._reasoning_end_token_ids
 
+    @property
+    def reasoning_canonical_end_token_ids(self) -> list[int] | None:
+        """Token IDs of the reasoning parser's default end string (e.g. the
+        tokenization of ``"</think>"``). Used as an additional natural exit
+        marker when the configured ``reasoning_end_str`` is a longer custom
+        sentence. Set automatically by `initialize_token_ids`."""
+        return self._reasoning_canonical_end_token_ids
+
+
     def initialize_token_ids(self, model_config: ModelConfig) -> None:
         """Initialize reasoning token IDs from strings using the tokenizer."""
         if (
@@ -71,6 +90,8 @@ class ReasoningConfig:
         tokenizer = cached_tokenizer_from_config(model_config=model_config)
         reasoning_start_str = self.reasoning_start_str
         reasoning_end_str = self.reasoning_end_str
+        parser_default_end_str: str | None = None
+
         if self.reasoning_parser is not None and (
             not reasoning_start_str or not reasoning_end_str
         ):
@@ -85,6 +106,12 @@ class ReasoningConfig:
             end_token = reasoning_parser.reasoning_end_str
             if end_token and not reasoning_end_str:
                 reasoning_end_str = end_token
+            # Remember the parser's own default end string so we can recognize
+            # a naturally emitted end-of-thinking marker even when the user
+            # configures a longer custom ``reasoning_end_str``.
+            if end_token:
+                parser_default_end_str = end_token
+
 
         if not reasoning_start_str or not reasoning_end_str:
             # If we don't have valid strings to tokenize,
@@ -96,6 +123,18 @@ class ReasoningConfig:
         self._reasoning_end_token_ids = tokenizer.encode(
             reasoning_end_str, add_special_tokens=False
         )
+        # Store canonical end token IDs from the parser's default end string
+        # when it differs from the configured end string.
+        if parser_default_end_str:
+            canonical_end_ids = tokenizer.encode(
+                parser_default_end_str, add_special_tokens=False
+            )
+            if (
+                canonical_end_ids
+                and canonical_end_ids != self._reasoning_end_token_ids
+            ):
+                self._reasoning_canonical_end_token_ids = canonical_end_ids
+
 
         if not self._reasoning_start_token_ids or not self._reasoning_end_token_ids:
             raise ValueError(

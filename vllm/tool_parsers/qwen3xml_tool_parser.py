@@ -54,6 +54,21 @@ class StreamingXMLToolCallParser:
     Supports streaming input, parsing, and output
     """
 
+    # Rolling tail buffer cap (bytes).  Only needs to hold the longest
+    # possible marker (~30 chars) with some margin for partial overlap.
+    # Prevents unbounded growth of ``streaming_buffer`` over long outputs.
+    _MARKER_BUF_CAP = 256
+
+    # Rolling tail buffer cap (bytes).  Only needs to hold the longest
+    # possible marker (~30 chars) with some margin for partial overlap.
+    # Prevents unbounded growth of ``streaming_buffer`` over long outputs.
+    _MARKER_BUF_CAP = 256
+
+    # Rolling tail buffer cap (bytes).  Only needs to hold the longest
+    # possible marker (~30 chars) with some margin for partial overlap.
+    # Prevents unbounded growth of ``streaming_buffer`` over long outputs.
+    _MARKER_BUF_CAP = 256
+
     def __init__(self):
         self.reset_streaming_state()
 
@@ -444,10 +459,12 @@ class StreamingXMLToolCallParser:
                     )
                     and self.text_content_buffer
                 ):
-                    # Output previously collected text content first
-                    text_delta = DeltaMessage(content=self.text_content_buffer)
-                    self._emit_delta(text_delta)
-                    # Clear buffer for potential subsequent text content
+                    # Emit buffered text only if it precedes the first tool call.
+                    # Text between tool calls is model noise and must NOT be
+                    # emitted as content (PR #37384: suppress inter-section noise).
+                    if self.tool_call_index == 0:
+                        text_delta = DeltaMessage(content=self.text_content_buffer)
+                        self._emit_delta(text_delta)
                     self.text_content_buffer = ""
 
                 # If a new tool_call starts and
@@ -488,6 +505,15 @@ class StreamingXMLToolCallParser:
 
             # Update processed position
             self.last_processed_pos = end_pos
+
+            # Trim ``streaming_buffer`` to a rolling tail to prevent unbounded
+            # growth over long outputs.  Keep a margin of ``_MARKER_BUF_CAP``
+            # bytes before ``last_processed_pos`` for lookbehind checks
+            # (``_is_structural_tag_position`` needs the char at pos-1).
+            if len(self.streaming_buffer) > self._MARKER_BUF_CAP * 2:
+                margin = min(self._MARKER_BUF_CAP, self.last_processed_pos)
+                self.streaming_buffer = self.streaming_buffer[margin:]
+                self.last_processed_pos -= margin
 
         # Flush any text accumulated AFTER the last </tool_call> processed
         # in this batch. Without this, trailing free text that arrives in
@@ -1341,10 +1367,12 @@ class StreamingXMLToolCallParser:
             )
             self._emit_delta(delta)
 
-            # Check if there's text content to output (between tool_calls)
-            if self.text_content_buffer.strip():
-                text_delta = DeltaMessage(content=self.text_content_buffer)
-                self._emit_delta(text_delta)
+            # Suppress inter-tool text: any text accumulated between tool
+            # calls is model noise and must NOT be emitted as content
+            # (matching the approach in PR #37384 for the Kimi parser).
+            # text_content_buffer is intentionally NOT cleared here;
+            # it will be cleared when the next tool call starts (fix 3)
+            # or flushed at the end of processing if no more tools appear.
 
             self._reset_xml_parser_after_tool_call()
 
@@ -1579,7 +1607,10 @@ class StreamingXMLToolCallParser:
         self.current_param_is_first = False
         self.should_emit_end_newline = False
         self.start_quote_emitted = False
-        self.text_content_buffer = ""
+        # Preserve accumulated inter-tool text.  The buffer will be
+        # cleared when the next tool call starts (suppressing inter-tool
+        # noise) or flushed at the end if trailing content exists.
+        # text_content_buffer intentionally NOT cleared here
 
         # Reset preprocessing and deferred parsing state
         self._pre_inside_parameter = False

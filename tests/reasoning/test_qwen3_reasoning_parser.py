@@ -691,11 +691,34 @@ def test_extract_reasoning_streaming_fragmented_end_and_tool_call(qwen3_tokenize
         delta_token_ids=[4],
     )
     
-    # If the parser split blindly at the point the tag completed in current_text,
-    # it would return 'ol_call>\n<function=' as content, missing the '<to' part.
-    if msg2 and msg2.content:
-        assert msg2.content != "ol_call>\n<function=", \
-            "Parser corrupted the tool call tag by splitting it across reasoning and content."
+    # With the stop-buffering fix, the end token text (</thinking>) is now
+    # detected from delta_text first, so delta 1 correctly splits:
+    #   reasoning=None, content="\n<to".
+    # In delta 2, since </thinking> is in previous_text, everything is content:
+    #   content="ol_call>\n<function=".
+    # The full tool call tag is correctly preserved: msg1.content + msg2.content.
+    # Delta 1: end token found in text → content starts with the tool call fragment.
+    assert msg1 is not None, "msg1 should not be None (end token in delta_text)."
+    assert msg1.content is not None, (
+        "msg1 should carry content (text after end token); got None. "
+        "Parser may have mis-categorised '<to' as reasoning."
+    )
+    assert "<to" in msg1.content, (
+        f"Tool call fragment '<to' missing from msg1.content ({msg1.content!r})."
+    )
+    assert msg1.reasoning is None, (
+        f"msg1.reasoning should be None (no reasoning after end token); got {msg1.reasoning!r}."
+    )
+    # Delta 2: everything is content (end already ended in previous_text).
+    assert msg2 is not None and msg2.content is not None, (
+        "msg2 should carry content; got None or empty."
+    )
+    assert "ol_call>" in msg2.content, (
+        f"Tool call fragment 'ol_call>' missing from msg2.content ({msg2.content!r})."
+    )
+    assert msg2.reasoning is None, (
+        f"msg2.reasoning should be None; got {msg2.reasoning!r}."
+    )
 
 
 def test_streaming_thinking_disabled_treats_output_as_content(qwen3_tokenizer):
