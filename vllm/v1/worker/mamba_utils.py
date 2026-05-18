@@ -288,6 +288,15 @@ class MambaSpecDecodeGPUContext:
     block_table_ptrs: torch.Tensor
     block_table_stride_req: int = 0
 
+    # Per-request staging buffers (CPU+GPU mirrors). The runner stages
+    # values into the CPU view in ``_prepare_inputs`` and the fused kernel
+    # reads the GPU side. These only exist when the postprocess kernel is
+    # enabled (spec decode + hybrid + align mode).
+    mamba_state_idx_buf: CpuGpuBuffer | None = None
+    num_scheduled_tokens_buf: CpuGpuBuffer | None = None
+    num_computed_tokens_buf: CpuGpuBuffer | None = None
+    num_draft_tokens_buf: CpuGpuBuffer | None = None
+
     # Flag to track if metadata has been populated
     is_initialized: bool = False
 
@@ -298,6 +307,7 @@ class MambaSpecDecodeGPUContext:
         kv_cache_config: KVCacheConfig,
         num_state_types: int,
         device: torch.device,
+        make_buffer: Callable[..., CpuGpuBuffer],
     ) -> "MambaSpecDecodeGPUContext":
         """Create context with allocated buffers (metadata populated later)."""
         mamba_group_ids, mamba_spec = get_mamba_groups(kv_cache_config)
@@ -339,6 +349,10 @@ class MambaSpecDecodeGPUContext:
             block_table_ptrs=torch.zeros(
                 len(mamba_group_ids), dtype=torch.int64, device=device
             ),
+            mamba_state_idx_buf=make_buffer(max_num_reqs, dtype=torch.int32),
+            num_scheduled_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
+            num_computed_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
+            num_draft_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             is_initialized=False,
         )
 
@@ -556,6 +570,7 @@ class MambaBuffers:
                     kv_cache_config=kv_cache_config,
                     num_state_types=len(copy_funcs),
                     device=device,
+                    make_buffer=make_buffer,
                 )
                 if with_postprocess
                 else None
@@ -744,10 +759,6 @@ def postprocess_mamba_gpu(
     bufs: "MambaBuffers",
     num_reqs: int,
     num_accepted_tokens_gpu: torch.Tensor,
-    mamba_state_idx_gpu: torch.Tensor,
-    num_scheduled_tokens_gpu: torch.Tensor,
-    num_computed_tokens_gpu: torch.Tensor,
-    num_draft_tokens_gpu: torch.Tensor,
     num_accepted_tokens_cpu_tensor: torch.Tensor,
     input_batch: GPUInputBatch,
     kv_cache_config: KVCacheConfig,
@@ -766,6 +777,10 @@ def postprocess_mamba_gpu(
     # Caller is responsible for gating on spec decode + hybrid; this assert is
     # a tripwire if those gates ever drift apart.
     assert ctx is not None
+    assert ctx.mamba_state_idx_buf is not None
+    assert ctx.num_scheduled_tokens_buf is not None
+    assert ctx.num_computed_tokens_buf is not None
+    assert ctx.num_draft_tokens_buf is not None
 
     if not ctx.is_initialized:
         ctx.initialize_from_forward_context(
@@ -781,10 +796,10 @@ def postprocess_mamba_gpu(
     ctx.run_fused_postprocess(
         num_reqs=num_reqs,
         num_accepted_tokens_gpu=num_accepted_tokens_gpu,
-        mamba_state_idx_gpu=mamba_state_idx_gpu,
-        num_scheduled_tokens_gpu=num_scheduled_tokens_gpu,
-        num_computed_tokens_gpu=num_computed_tokens_gpu,
-        num_draft_tokens_gpu=num_draft_tokens_gpu,
+        mamba_state_idx_gpu=ctx.mamba_state_idx_buf.gpu,
+        num_scheduled_tokens_gpu=ctx.num_scheduled_tokens_buf.gpu,
+        num_computed_tokens_gpu=ctx.num_computed_tokens_buf.gpu,
+        num_draft_tokens_gpu=ctx.num_draft_tokens_buf.gpu,
     )
 
     # ``num_accepted_tokens_out`` is pre-initialized from
@@ -859,34 +874,36 @@ def stage_mamba_state_idx_to_gpu(
 
 
 def stage_postprocess_inputs_to_gpu(
+    ctx: MambaSpecDecodeGPUContext,
     scheduler_output: SchedulerOutput,
     req_ids: list[str],
     num_reqs: int,
     requests: dict[str, CachedRequestState],
     mamba_state_idx: dict[str, int],
-    mamba_state_idx_buf: CpuGpuBuffer,
-    num_scheduled_tokens_buf: CpuGpuBuffer,
-    num_computed_tokens_buf: CpuGpuBuffer,
-    num_draft_tokens_buf: CpuGpuBuffer,
 ) -> None:
     """Stage all per-request inputs the fused mamba postprocess kernel reads.
 
     Bundles ``stage_mamba_state_idx_to_gpu`` and
     ``stage_postprocess_metadata_to_gpu`` into a single call so the runner
-    has one entry point for postprocess staging.
+    has one entry point for postprocess staging. Buffers live on ``ctx``
+    and only exist when the postprocess kernel is enabled.
     """
+    assert ctx.mamba_state_idx_buf is not None
+    assert ctx.num_scheduled_tokens_buf is not None
+    assert ctx.num_computed_tokens_buf is not None
+    assert ctx.num_draft_tokens_buf is not None
     stage_mamba_state_idx_to_gpu(
         mamba_state_idx,
         req_ids,
         num_reqs,
-        mamba_state_idx_buf,
+        ctx.mamba_state_idx_buf,
     )
     stage_postprocess_metadata_to_gpu(
         scheduler_output,
         req_ids,
         num_reqs,
         requests,
-        num_scheduled_tokens_buf,
-        num_computed_tokens_buf,
-        num_draft_tokens_buf,
+        ctx.num_scheduled_tokens_buf,
+        ctx.num_computed_tokens_buf,
+        ctx.num_draft_tokens_buf,
     )

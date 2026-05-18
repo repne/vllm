@@ -754,25 +754,6 @@ class GPUModelRunner(
             self.max_num_reqs, dtype=torch.int32
         )
 
-        # GPU snapshot of ``self.mamba_state_idx`` (the dict). Materialized
-        # in the staging path before each fused mamba postprocess kernel
-        # launch. Indexed by ``req_idx``.
-        self.mamba_state_idx_buf = self._make_buffer(
-            self.max_num_reqs, dtype=torch.int32
-        )
-
-        # Additional per-request metadata used to compute mamba state copy
-        # decisions on GPU without CPU-GPU synchronization.
-        self.num_scheduled_tokens_buf = self._make_buffer(
-            self.max_num_reqs, dtype=torch.int32
-        )
-        self.num_computed_tokens_buf = self._make_buffer(
-            self.max_num_reqs, dtype=torch.int32
-        )
-        self.num_draft_tokens_buf = self._make_buffer(
-            self.max_num_reqs, dtype=torch.int32
-        )
-
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
             # NOTE: `mrope_positions` is implemented with one additional dummy
@@ -1554,10 +1535,6 @@ class GPUModelRunner(
                 bufs=mamba_bufs,
                 num_reqs=num_reqs,
                 num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
-                mamba_state_idx_gpu=self.mamba_state_idx_buf.gpu,
-                num_scheduled_tokens_gpu=self.num_scheduled_tokens_buf.gpu,
-                num_computed_tokens_gpu=self.num_computed_tokens_buf.gpu,
-                num_draft_tokens_gpu=self.num_draft_tokens_buf.gpu,
                 num_accepted_tokens_cpu_tensor=(
                     self.input_batch.num_accepted_tokens_cpu_tensor
                 ),
@@ -4148,6 +4125,7 @@ class GPUModelRunner(
                 if deferred_state_corrections_fn:
                     deferred_state_corrections_fn()
                     deferred_state_corrections_fn = None
+                mamba_bufs = self._get_mamba_bufs()
                 mamba_utils.preprocess_mamba(
                     scheduler_output,
                     self.kv_cache_config,
@@ -4157,7 +4135,7 @@ class GPUModelRunner(
                     self.requests,
                     self.compilation_config.static_forward_context,
                     self.model.get_mamba_state_copy_func(),
-                    self._get_mamba_bufs().preprocess,
+                    mamba_bufs.preprocess,
                 )
                 # preprocess_mamba resets num_accepted_tokens_cpu to 1
                 # for requests whose state was copied to a new block.
@@ -4168,19 +4146,20 @@ class GPUModelRunner(
                 )
                 self.num_accepted_tokens.copy_to_gpu(num_reqs)
 
-                # Stage all per-request inputs the fused postprocess kernel
-                # reads (mamba_state_idx + scheduled/computed/draft counts).
-                mamba_utils.stage_postprocess_inputs_to_gpu(
-                    scheduler_output,
-                    self.input_batch.req_ids,
-                    num_reqs,
-                    self.requests,
-                    self.mamba_state_idx,
-                    self.mamba_state_idx_buf,
-                    self.num_scheduled_tokens_buf,
-                    self.num_computed_tokens_buf,
-                    self.num_draft_tokens_buf,
-                )
+                # Stage per-request inputs for the fused postprocess kernel
+                # only when that kernel will actually run. The kernel is
+                # gated on spec-decode + hybrid (see MambaBuffers.create);
+                # without it, ``mamba_bufs.postprocess`` is None and the
+                # staging buffers don't exist.
+                if mamba_bufs.postprocess is not None:
+                    mamba_utils.stage_postprocess_inputs_to_gpu(
+                        mamba_bufs.postprocess,
+                        scheduler_output,
+                        self.input_batch.req_ids,
+                        num_reqs,
+                        self.requests,
+                        self.mamba_state_idx,
+                    )
 
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
