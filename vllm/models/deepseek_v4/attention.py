@@ -13,7 +13,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import DeepseekV2Config, DeepseekV3Config
 
+
 import vllm.envs as envs
+import os
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
@@ -28,6 +30,7 @@ from vllm.models.deepseek_v4.common.ops import (
     fused_indexer_q_rope_quant,
     fused_inv_rope_fp8_quant,
     fused_q_kv_rmsnorm,
+    fused_qkv_rmsnorm_tilelang,
     sparse_prefill_combined_topk_size,
 )
 from vllm.models.deepseek_v4.nvidia.ops.fp8_einsum import (
@@ -506,14 +509,26 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             self.attn_gemm_parallel_execute(hidden_states)
         )
 
-        qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
-        qr, kv = fused_q_kv_rmsnorm(
-            qr,
-            kv,
-            self.q_norm.weight.data,
-            self.kv_norm.weight.data,
-            self.eps,
-        )
+        # VLLM_USE_TILELANG_RMSNORM switches between the Triton fused
+        # q/kv RMSNorm (two separate tensors) and the TileLang compact
+        # variant (consumes the unsplit GEMM output directly).
+        # TileLang is generally faster for large prefill batches.
+        if os.environ.get("VLLM_USE_TILELANG_RMSNORM", "0") == "1":
+            qr, kv = fused_qkv_rmsnorm_tilelang(
+                qr_kv,
+                self.q_norm.weight.data,
+                self.kv_norm.weight.data,
+                self.eps,
+            )
+        else:
+            qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
+            qr, kv = fused_q_kv_rmsnorm(
+                qr,
+                kv,
+                self.q_norm.weight.data,
+                self.kv_norm.weight.data,
+                self.eps,
+            )
 
         # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride
         # on the default stream so q stays on its consumer stream (mla_attn
