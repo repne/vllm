@@ -15,6 +15,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
     SingleTypeKVCacheManager,
+    SlidingWindowManager,
     get_manager_for_kv_cache_spec,
 )
 from vllm.v1.kv_cache_interface import (
@@ -250,6 +251,21 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.remove_skipped_blocks(request_id, total_computed_tokens)
 
+    def release_protected_prompt_blocks(
+        self,
+        target_free_blocks: int | None = None,
+        block_ids_to_skip: set[int] | None = None,
+    ) -> None:
+        for manager in self.single_type_managers:
+            if (
+                target_free_blocks is not None
+                and self.block_pool.get_num_free_blocks() >= target_free_blocks
+            ):
+                return
+            manager.release_protected_prompt_blocks(
+                target_free_blocks, block_ids_to_skip
+            )
+
     def get_blocks(self, request_id: str) -> tuple[list[KVCacheBlock], ...]:
         """
         Get the blocks for the request.
@@ -475,6 +491,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # block cache hit yet.
         block_sizes = [spec.block_size for spec, _, _ in attention_groups]
         self.lcm_block_size = lcm(*block_sizes)
+        for manager in self.single_type_managers:
+            manager.cache_alignment_tokens = self.lcm_block_size
 
         # Attention-group indices (into ``self.attention_groups``) that
         # contain at least one EAGLE/MTP KV cache group.
@@ -483,6 +501,18 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             for i, (_, group_ids, _) in enumerate(self.attention_groups)
             if any(gid in self.eagle_group_ids for gid in group_ids)
         }
+
+        # Eagle/MTP adds +1 to sliding_window_contiguous_blocks and uses
+        # post_pop_blocks = i (instead of i+1) for alignment.  This makes
+        # the SWA cache-block mask too aggressive — it skips blocks that
+        # eagle's modified lookup actually needs, yielding 0 % hit rate.
+        # Disable the mask for SWA managers inside eagle attention groups.
+        for idx in self.eagle_attn_group_indices:
+            _, group_ids, _ = self.attention_groups[idx]
+            for gid in group_ids:
+                mgr = self.single_type_managers[gid]
+                if isinstance(mgr, SlidingWindowManager):
+                    mgr.eagle_extra_cache_blocks = 1
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         # Cache hits in this coordinator are always a multiple of
