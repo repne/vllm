@@ -89,6 +89,87 @@ def apply_penalties(
     return logits
 
 
+def _tinygemm_bf16_impl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    """Real implementation: calls FlashInfer tinygemm via lazy wrapper."""
+    from vllm.utils.flashinfer import flashinfer_tinygemm_bf16
+    out = torch.empty(
+        input.shape[0], weight.shape[0],
+        dtype=torch.bfloat16, device=input.device,
+    )
+    flashinfer_tinygemm_bf16(input, weight, out, bias=bias)
+    return out
+
+
+def _tinygemm_bf16_fake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    """Fake implementation for torch.compile graph tracing."""
+    return torch.empty(
+        input.shape[0], weight.shape[0],
+        dtype=torch.bfloat16, device=input.device,
+    )
+
+
+_TINYGEMM_AVAILABLE = False
+
+
+def _init_tinygemm():
+    """Register tinygemm custom op if FlashInfer is available on SM90+."""
+    global _TINYGEMM_AVAILABLE
+    try:
+        from vllm.utils.flashinfer import has_flashinfer
+        if not has_flashinfer():
+            return
+        capability = current_platform.get_device_capability()
+        if capability is None or capability[0] < 9:
+            return
+        direct_register_custom_op(
+            "tinygemm_bf16",
+            _tinygemm_bf16_impl,
+            fake_impl=_tinygemm_bf16_fake,
+        )
+        _TINYGEMM_AVAILABLE = True
+    except Exception:
+        pass
+
+
+_init_tinygemm()
+
+
+def _tinygemm_unquantized_gemm(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+):
+    num_tokens = x.numel() // x.shape[-1]
+    if (
+        num_tokens <= 8
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and weight.shape[0] % 16 == 0
+        and x.is_contiguous()
+        and weight.is_contiguous()
+        and (bias is None or bias.dtype == torch.bfloat16)
+    ):
+        if bias is None:
+            bias = torch.zeros(
+                weight.shape[0], dtype=torch.bfloat16, device=x.device,
+            )
+        out_shape = (*x.shape[:-1], weight.shape[0])
+        result = torch.ops.vllm.tinygemm_bf16(
+            x.view(num_tokens, -1), weight, bias,
+        )
+        return result.view(out_shape)
+    return torch.nn.functional.linear(x, weight, bias)
+
+
 def default_unquantized_gemm(
     layer: torch.nn.Module,
     x: torch.Tensor,
@@ -322,5 +403,7 @@ def dispatch_unquantized_gemm() -> Callable[..., torch.Tensor]:
         return rocm_unquantized_gemm
     elif current_platform.is_cpu():
         return cpu_unquantized_gemm
+    elif _TINYGEMM_AVAILABLE:
+        return _tinygemm_unquantized_gemm
     else:
         return default_unquantized_gemm
