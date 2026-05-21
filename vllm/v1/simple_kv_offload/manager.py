@@ -311,6 +311,16 @@ class SimpleCPUOffloadScheduler:
 
         skipped = sum(blk.block_hash is not None for blk in blocks.blocks[self.fa_gidx])
         num_computed_tokens = skipped * self.block_size
+        hashes_to_load = request.block_hashes[skipped : skipped + num_blocks_to_load]
+
+        # Find CPU cached blocks across all groups.
+        max_hit_len = len(hashes_to_load) * self.block_size
+        cpu_hit_blocks, hit_length, _ = self.cpu_coordinator.find_longest_cache_hit(
+            hashes_to_load, max_hit_len
+        )
+        assert hit_length == num_external_tokens, (
+            f"Expected {num_external_tokens} hit tokens, got {hit_length}"
+        )
 
         # Build transfer pairs across all groups.
         total_computed_tokens = num_computed_tokens + num_external_tokens
