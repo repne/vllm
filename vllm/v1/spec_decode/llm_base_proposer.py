@@ -229,7 +229,7 @@ class SpecDecodeBaseProposer:
         self._enable_probabilistic_draft_probs = (
             self.speculative_config.rejection_sample_method == "standard"
             and self.speculative_config.draft_sample_method == "probabilistic"
-        ) or self.method == "mtp"
+        )
         # MTP drafts benefit from probabilistic sampling at ``temperature > 0``:
         # the draft model is a near-copy of the target, so sampling from
         # ``softmax(draft_logits)`` covers the target distribution much better
