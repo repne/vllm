@@ -385,7 +385,12 @@ class Scheduler(SchedulerInterface):
         very_long_prefill_threshold = (
             self.max_num_scheduled_tokens * very_long_prefill_steps
         )
-        if remaining_prefill > very_long_prefill_threshold:
+        if has_scheduled_decode:
+            if remaining_prefill > very_long_prefill_threshold:
+                mixed_prefill_budget = max(1, self.max_num_scheduled_tokens // 8)
+            else:
+                mixed_prefill_budget = max(1, self.max_num_scheduled_tokens // 4)
+        elif remaining_prefill > very_long_prefill_threshold:
             mixed_prefill_budget = max(1, self.max_num_scheduled_tokens // 2)
         else:
             mixed_prefill_budget = max(1, (self.max_num_scheduled_tokens * 3) // 4)
