@@ -73,9 +73,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     STORE_FINAL_STATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    USE_EXP2: tl.constexpr,
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     HAS_INITIAL_STATE_MASK: tl.constexpr,
+    USE_EXP2: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -357,9 +357,9 @@ def chunk_gated_delta_rule_fwd_h(
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
     chunk_offsets: torch.Tensor | None = None,
-    use_exp2: bool = False,
     ssm_state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    use_exp2: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # This kernel is slightly different from fla to support Q/K with different head numbers.
     # In fla, Q/K always have the same head number, so Hg is always equal to H.
@@ -422,10 +422,10 @@ def chunk_gated_delta_rule_fwd_h(
         K=K,
         V=V,
         BT=BT,
-        USE_EXP2=use_exp2,
         stride_init_state_token=stride_init_state_token,
         stride_final_state_token=stride_final_state_token,
         stride_indices_seq=stride_indices_seq,
         stride_has_initial_state=stride_has_initial_state,
+        USE_EXP2=use_exp2,
     )
     return h, v_new, final_state
