@@ -686,20 +686,16 @@ class DelegatingParser(Parser):
                 current_token_ids=current_token_ids,
                 delta_token_ids=delta_token_ids,
             )
-            # Hand off remaining content to tool parser.
-            # Use is_reasoning_end_streaming for delta checks: it correctly
-            # detects <tool_call> in the current delta without the
-            # paired-token guard that is_reasoning_end applies for prompts.
-            if self._tool_parser and self.is_reasoning_end_streaming(
-                current_token_ids, delta_token_ids
-            ):
+            if self.is_reasoning_end_streaming(current_token_ids, delta_token_ids):
                 state.reasoning_ended = True
                 current_token_ids = self.extract_content_ids(delta_token_ids)
-                if delta_message and delta_message.content:
-                    current_text = delta_message.content
-                    delta_message.content = None
-                else:
-                    current_text = ""
+                current_text = (
+                    delta_message.content
+                    if delta_message and delta_message.content
+                    else ""
+                )
+                delta_text = current_text
+                delta_token_ids = current_token_ids
 
         # Tool call extraction
         if self._in_tool_call_phase(state):
@@ -709,12 +705,10 @@ class DelegatingParser(Parser):
                 state.previous_token_ids = []
                 delta_text = current_text
                 delta_token_ids = current_token_ids
-            # Preserve any reasoning text produced by extract_reasoning_streaming
-            # in the same delta as the reasoning→tool-call transition.  Without
-            # this, the assignment below would silently drop that last fragment.
-            reasoning_from_transition = (
-                delta_message.reasoning if delta_message is not None else None
-            )
+
+            # A boundary delta may carry both reasoning and tool call,
+            # save it before the tool parser overwrites delta_message.
+            reasoning = delta_message.reasoning if delta_message else None
             delta_message, state.function_name_returned = (
                 self._extract_tool_calls_streaming(
                     previous_text=state.previous_text,
@@ -729,11 +723,11 @@ class DelegatingParser(Parser):
                     function_name_returned=state.function_name_returned,
                 )
             )
-            if reasoning_from_transition:
-                if delta_message is not None:
-                    delta_message.reasoning = reasoning_from_transition
-                else:
-                    delta_message = DeltaMessage(reasoning=reasoning_from_transition)
+            if reasoning:
+                if not delta_message:
+                    delta_message = DeltaMessage()
+                delta_message.reasoning = reasoning
+
             if (
                 delta_message
                 and delta_message.tool_calls
