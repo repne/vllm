@@ -93,10 +93,6 @@ class Qwen3CoderToolParser(ToolParser):
                 "tokens in the tokenizer!"
             )
 
-        logger.debug(
-            "vLLM Successfully import tool parser %s !", self.__class__.__name__
-        )
-
     def _generate_tool_call_id(self) -> str:
         """Generate a unique tool call ID."""
         return f"call_{uuid.uuid4().hex[:24]}"
