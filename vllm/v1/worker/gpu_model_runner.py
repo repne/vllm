@@ -1504,12 +1504,34 @@ class GPUModelRunner(
         self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
 
         if self.cache_config.mamba_cache_mode == "align":
+            # Skip the fused postprocess kernel when it's provably a no-op
+            # this step. With ``n_draft + 1`` bounding the accepted tokens,
+            # we can decide on CPU whether any request can cross a mamba
+            # block boundary. If not, defer the device-to-host sync of
+            # ``num_accepted_tokens`` -- the event.synchronize() in
+            # ``_prepare_inputs`` absorbs the wait next iteration.
+            mamba_bufs = self._get_mamba_bufs()
+            assert mamba_bufs.postprocess_align is not None
+            if mamba_utils.can_skip_mamba_postprocess(
+                scheduler_output,
+                self.input_batch,
+                self.requests,
+                mamba_bufs.postprocess_align.block_size,
+                num_reqs,
+            ):
+                self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+                    self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
+                )
+                assert self.num_accepted_tokens_event is not None
+                self.num_accepted_tokens_event.record()
+                return
+
             # Fused GPU postprocess: state copies + per-request accepted-token
             # update without CPU-GPU sync. The metadata
             # (num_scheduled_tokens, num_draft_tokens, num_computed_tokens) is
             # pre-staged to GPU buffers in _prepare_inputs.
             mamba_utils.postprocess_mamba_align_gpu(
-                bufs=self._get_mamba_bufs(),
+                bufs=mamba_bufs,
                 num_reqs=num_reqs,
                 num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
                 num_accepted_tokens_cpu_tensor=(
