@@ -254,9 +254,15 @@ def _resolve_gdn_prefill_backend(
     if not current_platform.is_cuda():
         return backend, "triton"
 
+    hf_config = vllm_config.model_config.hf_config
+    hf_text_config = vllm_config.model_config.hf_text_config
     head_k_dim = getattr(
-        vllm_config.model_config.hf_config, "linear_key_head_dim", None
-    )
+        hf_config, "linear_key_head_dim", None
+    ) or getattr(hf_text_config, "linear_key_head_dim", None)
+    if head_k_dim is None:
+        head_k_dim = getattr(hf_config, "head_dim", None) or getattr(
+            hf_text_config, "head_dim", None
+        )
 
     supports_flashinfer = False
     supports_cutedsl = False
@@ -295,9 +301,15 @@ def _log_gdn_backend_decision(
     active_backend: str,
 ) -> None:
     """Log the GDN prefill backend choice in the attention-selector style."""
+    hf_config = vllm_config.model_config.hf_config
+    hf_text_config = vllm_config.model_config.hf_text_config
     head_k_dim = getattr(
-        vllm_config.model_config.hf_config, "linear_key_head_dim", None
-    )
+        hf_config, "linear_key_head_dim", None
+    ) or getattr(hf_text_config, "linear_key_head_dim", None)
+    if head_k_dim is None:
+        head_k_dim = getattr(hf_config, "head_dim", None) or getattr(
+            hf_text_config, "head_dim", None
+        )
     chosen = {
         "flashinfer": "FlashInfer",
         "cutedsl": "CuteDSL",
