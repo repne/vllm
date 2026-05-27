@@ -513,6 +513,31 @@ mod tests {
     }
 
     #[test]
+    fn minimax_m2_streaming_handles_template_whitespace_and_split_parameters() {
+        let text = concat!(
+            "I will call the tools.\n",
+            "<minimax:tool_call>\n",
+            "<invoke name=\"get_weather\">\n",
+            "<parameter name=\"city\">Seattle</parameter>\n",
+            "</invoke>\n",
+            "<invoke name=\"get_weather\">\n",
+            "<parameter name=\"city\">NYC</parameter>\n",
+            "</invoke>\n",
+            "</minimax:tool_call>",
+        );
+        let chunks = split_by_chars(text, 7);
+        let mut parser = MinimaxM2ToolParser::new(&test_tools());
+        let result = collect_stream(&mut parser, &chunks);
+
+        assert_eq!(result.normal_text, "I will call the tools.\n");
+        assert_eq!(result.calls.len(), 2);
+        assert_eq!(result.calls[0].tool_index, 0);
+        assert_eq!(result.calls[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(result.calls[1].tool_index, 1);
+        assert_eq!(result.calls[1].name.as_deref(), Some("get_weather"));
+    }
+
+    #[test]
     fn minimax_m2_streaming_ignores_text_after_tool_block() {
         let text = format!(
             "{} ignored",
