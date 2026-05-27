@@ -6602,6 +6602,18 @@ class GPUModelRunner(
         assert len(self.attn_groups) == 0, "Attention backends are already initialized"
 
         class AttentionGroupKey(NamedTuple):
+            """Deduplication key for attention groups within a KV cache group.
+
+            Splits on per-rank ``num_heads_q`` in addition to backend + spec
+            so layers with different Q-head counts (e.g. a spec-decode draft
+            with fewer attention heads than its target) get separate metadata
+            builders. The builders' scratch (e.g. ``softmax_segm_*`` in
+            ``triton_attn``, ``num_qo_heads`` in FlashInfer) is sized by
+            ``num_heads_q`` and assumes uniformity within the group; see
+            ``get_num_attention_heads_from_layers`` in
+            ``vllm/v1/attention/backends/utils.py``.
+            """
+
             attn_backend: type[AttentionBackend]
             kv_cache_spec: KVCacheSpec
             metadata_group_key: tuple[Any, ...]
@@ -6651,11 +6663,11 @@ class GPUModelRunner(
             kv_cache_group_id: int,
         ) -> list[AttentionGroup]:
             attn_groups: list[AttentionGroup] = []
-            for group_key, layer_names in attn_backends_map.items():
+            for key, layer_names in attn_backends_map.items():
                 attn_group = AttentionGroup(
-                    group_key.attn_backend,
+                    key.attn_backend,
                     layer_names,
-                    group_key.kv_cache_spec,
+                    key.kv_cache_spec,
                     kv_cache_group_id,
                 )
 

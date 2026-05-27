@@ -1402,9 +1402,9 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
-            if scheduled_spec_token_ids and generated_token_ids:
+            if scheduled_spec_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
-                num_accepted = len(generated_token_ids) - 1
+                num_accepted = max(len(generated_token_ids) - 1, 0)
                 num_rejected = num_draft_tokens - num_accepted
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
@@ -2003,8 +2003,16 @@ class Scheduler(SchedulerInterface):
 
     def reset_connector_cache(self) -> bool:
         if self.connector is None:
-            logger.warning("reset_connector called but no KV connector is configured.")
-            return False
+            # No connector attached -> nothing to reset, treat as success so
+            # callers that unconditionally request a connector reset (e.g. as
+            # part of a cache-clearing cascade after a weight update) don't
+            # see reset_prefix_cache() flip to False purely because they
+            # didn't configure a connector.
+            logger.debug(
+                "reset_connector requested but no KV connector is configured; "
+                "treating as no-op success."
+            )
+            return True
 
         if self.connector.reset_cache() is False:
             return False

@@ -774,6 +774,27 @@ def test_scheduler_reset_prefix_cache():
         assert scheduler.waiting[i] == request
 
 
+def test_reset_connector_cache_no_connector_is_no_op_success():
+    """``reset_connector_cache`` must return True when no connector is
+    configured.
+
+    Without this, ``reset_prefix_cache(reset_connector=True)`` returns
+    ``False`` on every engine that doesn't have a KV connector configured —
+    even when the local prefix cache reset succeeded — and any caller that
+    interprets the return value as "did the reset I asked for succeed?"
+    sees a spurious failure.
+    """
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    assert scheduler.connector is None
+
+    # No-connector reset is treated as success.
+    assert scheduler.reset_connector_cache() is True
+
+    # End-to-end: reset_prefix_cache(reset_connector=True) on an idle
+    # scheduler succeeds with or without a connector.
+    assert scheduler.reset_prefix_cache(reset_connector=True) is True
+
+
 # Note - these test cases mirror some of those in test_rejection_sampler.py
 @pytest.mark.parametrize(
     "spec_tokens,output_tokens,expected",
@@ -886,11 +907,12 @@ def test_schedule_spec_decoding_stats(spec_tokens, output_tokens, expected):
 
 
 def test_spec_decoding_stats_empty_output():
-    """Test that spec decoding stats handle empty output tokens gracefully.
+    """Test that spec decode accounting handles empty output tokens.
 
-    This is a regression test for a bug where empty sampled_token_ids
-    would cause num_accepted = len([]) - 1 = -1, leading to a
-    ValueError when incrementing a Prometheus counter with a negative value.
+    Empty sampled_token_ids should count all scheduled draft tokens as
+    rejected. Otherwise num_computed_tokens can stay caught up with
+    num_tokens_with_spec for an unfinished request, causing the scheduler to
+    stop issuing work.
     """
     num_spec_tokens = 3
     scheduler = create_scheduler(num_speculative_tokens=num_spec_tokens)
@@ -924,8 +946,7 @@ def test_spec_decoding_stats_empty_output():
     assert req_id in output.scheduled_spec_decode_tokens
     assert len(output.scheduled_spec_decode_tokens[req_id]) == 3
 
-    # Simulate empty output tokens (e.g., due to request abortion or error)
-    # This would previously cause num_accepted = -1 and crash
+    # Simulate empty output tokens from rejection sampling.
     model_runner_output = ModelRunnerOutput(
         req_ids=[req_id],
         req_id_to_index={req_id: 0},
@@ -935,14 +956,23 @@ def test_spec_decoding_stats_empty_output():
         pooler_output=[],
     )
 
-    # This should not raise an error
     engine_core_outputs = scheduler.update_from_output(output, model_runner_output)
 
-    # Spec decoding stats should be None since no tokens were generated
     scheduler_stats = (
         engine_core_outputs[0].scheduler_stats if engine_core_outputs else None
     )
-    assert scheduler_stats is None or scheduler_stats.spec_decoding_stats is None
+    assert scheduler_stats is not None
+    assert scheduler_stats.spec_decoding_stats is not None
+    stats = scheduler_stats.spec_decoding_stats
+    assert stats.num_drafts == 1
+    assert stats.num_draft_tokens == num_spec_tokens
+    assert stats.num_accepted_tokens == 0
+    assert stats.num_accepted_tokens_per_pos == [0] * num_spec_tokens
+
+    # No output was appended, but the computed token count should be rolled
+    # back by the rejected draft count so the request can make future progress.
+    assert request.num_output_tokens == 1
+    assert request.num_computed_tokens == request.num_tokens
 
 
 def test_no_spec_tokens_scheduled_for_prefill_chunks():
