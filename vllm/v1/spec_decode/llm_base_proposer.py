@@ -114,7 +114,7 @@ class SpecDecodeBaseProposer:
         self.parallel_drafting_hidden_state_tensor: torch.Tensor | None = None
         if self.parallel_drafting:
             self._init_parallel_drafting_params()
-        self.use_local_argmax_reduction: bool = (
+        self.use_local_argmax_reduction: bool | None = (
             self.speculative_config.use_local_argmax_reduction
         )
 
@@ -1260,6 +1260,7 @@ class SpecDecodeBaseProposer:
 
         self._maybe_share_embeddings(target_language_model)
         self._maybe_share_lm_head(target_language_model)
+        self._resolve_local_argmax_reduction()
 
         if (
             self.parallel_drafting
@@ -1425,6 +1426,20 @@ class SpecDecodeBaseProposer:
                 "Sharing target model topk_indices_buffer with the draft model."
             )
 
+    def _resolve_local_argmax_reduction(self) -> None:
+        if self.use_local_argmax_reduction is None:
+            self.use_local_argmax_reduction = bool(
+                hasattr(self.model, "get_top_tokens")
+                and getattr(self.model, "supports_remapped_top_tokens", False)
+                and hasattr(self.model, "draft_id_to_target_id")
+                and self.model.draft_id_to_target_id is not None
+            )
+            if self.use_local_argmax_reduction:
+                logger.info_once(
+                    "Auto-enabling local argmax reduction for remapped draft "
+                    "token generation."
+                )
+
         if self.use_local_argmax_reduction:
             if not hasattr(self.model, "get_top_tokens"):
                 raise ValueError(
@@ -1437,6 +1452,7 @@ class SpecDecodeBaseProposer:
             if (
                 hasattr(self.model, "draft_id_to_target_id")
                 and self.model.draft_id_to_target_id is not None
+                and not getattr(self.model, "supports_remapped_top_tokens", False)
             ):
                 logger.warning(
                     "use_local_argmax_reduction is enabled but draft model "
