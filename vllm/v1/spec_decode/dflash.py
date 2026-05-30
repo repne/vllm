@@ -74,6 +74,8 @@ class DFlashProposer(SpecDecodeBaseProposer):
         # DFlash embeds mask tokens directly.
         self.parallel_drafting_hidden_state_tensor = None
 
+        self.dflash_causal = self.dflash_config.get("causal", False)
+
     @override
     def allow_multiple_draft_kv_cache_groups(self) -> bool:
         return True
@@ -113,7 +115,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             base,
             attention_config=replace(
                 base.attention_config,
-                use_non_causal=True,
+                use_non_causal=not self.dflash_causal,
             ),
         )
 
@@ -301,7 +303,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             max_seq_len=cad.max_seq_len + num_query_per_req,
             block_table_tensor=self._get_dflash_block_table(primary_kv_cache_gid, cad),
             slot_mapping=query_slot_mapping,
-            causal=False,  # Non-causal attention is required for DFlash
+            causal=self.dflash_causal,
         )
 
         return num_query_total, token_indices_to_sample, new_cad
@@ -394,6 +396,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         self, cad: CommonAttentionMetadata, draft_index: int = 0
     ) -> tuple[list[object], dict[str, object]]:
         self._ensure_slot_mapping_buffers()
+        dflash_causal = getattr(self, "dflash_causal", False)
         sliding_layer_names: set[str] = getattr(
             self.model, "sliding_attention_layer_names", set()
         )
@@ -407,7 +410,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
                 slot_mapping=self._slot_mapping_buffers_by_gid[kv_cache_gid][1][
                     : cad.num_actual_tokens
                 ],
-                causal=False,
+                causal=dflash_causal,
             )
             attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
                 common_attn_metadata=group_cad,
@@ -418,11 +421,10 @@ class DFlashProposer(SpecDecodeBaseProposer):
                 per_layer[layer_name] = attn_metadata
 
             # DFlash layers consume attention metadata through the per-layer
-            # forward context. Keep the non-causal group metadata for
-            # group-level spec decode checks, and specialize only the SWA
-            # layers that need a causal sliding-window mask.
+            # forward context. In the default non-causal mode, specialize only
+            # the SWA layers that need a causal sliding-window mask.
             causal_layers = sliding_layer_names & set(attn_group.layer_names)
-            if causal_layers:
+            if causal_layers and not dflash_causal:
                 causal_attn_metadata = (
                     attn_group.get_metadata_builder().build_for_drafting(
                         common_attn_metadata=group_cad.replace(causal=True),
@@ -439,6 +441,12 @@ class DFlashProposer(SpecDecodeBaseProposer):
                     " causal support, which is required for DFlash SWA."
                 )
                 continue
+            if dflash_causal:
+                assert getattr(attn_metadata, "causal", None) is True, (
+                    f"Attention metadata for layer {layer_name} does not have"
+                    " causal support, which is required by DFlash causal mode."
+                )
+                continue
             assert getattr(attn_metadata, "causal", None) is False, (
                 f"Attention metadata for layer {layer_name} does not have"
                 " non-causal support, which is required for DFlash."
@@ -448,10 +456,8 @@ class DFlashProposer(SpecDecodeBaseProposer):
 
     @override
     def _get_eagle3_use_aux_hidden_state_from_config(self):
-        use_aux_hidden_state = True
-        dflash_config = getattr(
-            self.draft_model_config.hf_config, "dflash_config", None
-        )
-        if dflash_config is not None:
-            use_aux_hidden_state = dflash_config.get("use_aux_hidden_state", True)
-        return use_aux_hidden_state
+        return self.dflash_config.get("use_aux_hidden_state", True)
+
+    @property
+    def dflash_config(self):
+        return getattr(self.draft_model_config.hf_config, "dflash_config", None) or {}
