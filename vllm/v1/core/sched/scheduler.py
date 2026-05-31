@@ -211,6 +211,7 @@ class Scheduler(SchedulerInterface):
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
         self.requires_eagle_cache_drop = False
+        self.use_dflash = False
         self.num_spec_tokens = self.num_lookahead_tokens = 0
         if speculative_config:
             self.num_spec_tokens = speculative_config.num_speculative_tokens
@@ -220,6 +221,8 @@ class Scheduler(SchedulerInterface):
                     speculative_config.requires_eagle_cache_drop()
                 )
                 self.num_lookahead_tokens = self.num_spec_tokens
+            if speculative_config.use_dflash():
+                self.use_dflash = True
             if speculative_config.uses_draft_model():
                 self.num_lookahead_tokens = self.num_spec_tokens
             if speculative_config.use_dflash():
@@ -714,8 +717,18 @@ class Scheduler(SchedulerInterface):
                 # creates a mismatch between the number
                 # of local and remote blocks.
                 limit_lookahead_tokens = load_kv_async and self.use_eagle
+                # DFlash is an exception because it proposes draft tokens in the
+                # same model runner step as the first prefill, and its query
+                # slot mappings immediately address positions after the prompt.
                 effective_lookahead_tokens = (
-                    0 if limit_lookahead_tokens else self.num_lookahead_tokens
+                    self.num_lookahead_tokens
+                    if (
+                        not limit_lookahead_tokens
+                        and (
+                            self.use_dflash or request.num_computed_tokens != 0
+                        )
+                    )
+                    else 0
                 )
 
                 # Determine if we need to allocate cross-attention blocks.
