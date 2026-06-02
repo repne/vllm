@@ -323,8 +323,32 @@ class ChunkGatedDeltaRule(CustomOp):
         chunk_indices: torch.Tensor | None = None,
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
+        ssm_state_indices: torch.Tensor | None = None,
+        has_initial_state: torch.Tensor | None = None,
         core_attn_out: torch.Tensor | None = None,
     ):
+        if ssm_state_indices is not None:
+            assert has_initial_state is not None
+            gathered_initial = initial_state[ssm_state_indices].contiguous()
+            gathered_initial[~has_initial_state, ...] = 0
+            o, final_state = fi_chunk_gated_delta_rule(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=gathered_initial,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            )
+            if output_final_state:
+                initial_state[ssm_state_indices] = final_state.to(initial_state.dtype)
+            if core_attn_out is not None:
+                o_flat = o.squeeze(0).reshape(-1)
+                co_flat = core_attn_out.reshape(-1)
+                co_flat[: o_flat.numel()].copy_(o_flat)
+            return o, final_state
         o, final_state = fi_chunk_gated_delta_rule(
             q=q,
             k=k,
@@ -355,6 +379,8 @@ class ChunkGatedDeltaRule(CustomOp):
         chunk_indices: torch.Tensor | None = None,
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = True,
+        ssm_state_indices: torch.Tensor | None = None,
+        has_initial_state: torch.Tensor | None = None,
         core_attn_out: torch.Tensor | None = None,
     ):
         return fla_chunk_gated_delta_rule(
@@ -369,6 +395,8 @@ class ChunkGatedDeltaRule(CustomOp):
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            ssm_state_indices=ssm_state_indices,
+            has_initial_state=has_initial_state,
             core_attn_out=core_attn_out,
         )
 
@@ -1461,10 +1489,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
-            assert non_spec_state_indices_tensor is not None
-            initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()  # type: ignore[index]
-            assert has_initial_state is not None
-            initial_state[~has_initial_state, ...] = 0  # type: ignore[operator]
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -1474,16 +1498,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 v=value_non_spec,
                 g=g_non_spec,
                 beta=beta_non_spec,
-                initial_state=initial_state,
+                initial_state=ssm_state,
                 output_final_state=True,
                 cu_seqlens=non_spec_query_start_loc,
                 chunk_indices=attn_metadata.chunk_indices,
                 chunk_offsets=attn_metadata.chunk_offsets,
                 use_qk_l2norm_in_kernel=False,
-            )
-            # Init cache
-            ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
-                ssm_state.dtype
+                ssm_state_indices=non_spec_state_indices_tensor,
+                has_initial_state=has_initial_state,
             )
         elif attn_metadata.num_decodes > 0:
             core_attn_out_non_spec, last_recurrent_state = (
@@ -1506,7 +1528,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 )
             )
         else:
-            core_attn_out_non_spec, last_recurrent_state = None, None
+            core_attn_out_non_spec, _last_recurrent_state = None, None
 
         # 3. Merge core attention output
         if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
