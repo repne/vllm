@@ -6679,9 +6679,10 @@ class GPUModelRunner(
         class AttentionGroupKey(NamedTuple):
             """Deduplication key for attention groups within a KV cache group.
 
-            Splits on per-rank ``num_heads_q`` in addition to backend + spec
-            so layers with different Q-head counts (e.g. a spec-decode draft
-            with fewer attention heads than its target) get separate metadata
+            Splits on per-rank ``num_heads_q`` and backend metadata key in
+            addition to backend + spec so layers with different Q-head counts
+            (e.g. a spec-decode draft with fewer attention heads than its
+            target) or backend-specific metadata requirements get separate
             builders. The builders' scratch (e.g. ``softmax_segm_*`` in
             ``triton_attn``, ``num_qo_heads`` in FlashInfer) is sized by
             ``num_heads_q`` and assumes uniformity within the group; see
@@ -6692,6 +6693,7 @@ class GPUModelRunner(
             attn_backend: type[AttentionBackend]
             kv_cache_spec: KVCacheSpec
             num_heads_q: int
+            metadata_group_key: tuple[Any, ...]
 
         def get_attn_backends_for_group(
             kv_cache_group_spec: KVCacheGroupSpec,
@@ -6727,9 +6729,20 @@ class GPUModelRunner(
                 # fallback can never spuriously merge them with attention
                 # layers.
                 num_heads_q = getattr(layers[layer_name], "num_heads", 0)
-                key = (full_cls_name, layer_kv_cache_spec, num_heads_q)
+                metadata_group_key = attn_backend.get_metadata_group_key(
+                    layers[layer_name]
+                )
+                key = (
+                    full_cls_name,
+                    layer_kv_cache_spec,
+                    num_heads_q,
+                    metadata_group_key,
+                )
                 attn_backends[key] = AttentionGroupKey(
-                    attn_backend, layer_kv_cache_spec, num_heads_q
+                    attn_backend,
+                    layer_kv_cache_spec,
+                    num_heads_q,
+                    metadata_group_key,
                 )
                 attn_backend_layers[key].append(layer_name)
             return (
@@ -6742,11 +6755,11 @@ class GPUModelRunner(
             kv_cache_group_id: int,
         ) -> list[AttentionGroup]:
             attn_groups: list[AttentionGroup] = []
-            for key, layer_names in attn_backends_map.items():
+            for group_key, layer_names in attn_backends_map.items():
                 attn_group = AttentionGroup(
-                    key.attn_backend,
+                    group_key.attn_backend,
                     layer_names,
-                    key.kv_cache_spec,
+                    group_key.kv_cache_spec,
                     kv_cache_group_id,
                 )
 
