@@ -1063,7 +1063,9 @@ def test_hybrid_cache_mamba_align_shared_prefix_detection():
     # Validate scheduler logic for num_uncached_common_prefix_tokens > 0
     # Create minimal mock with just the needed attributes
     mock = SimpleNamespace(
-        cache_config=SimpleNamespace(block_size=block_size), use_eagle=False
+        cache_config=SimpleNamespace(block_size=block_size),
+        requires_eagle_cache_drop=False,
+        use_eagle=False,
     )
     num_new_tokens_adjusted = Scheduler._mamba_block_aligned_split(
         self=mock,
@@ -2646,7 +2648,7 @@ def test_hybrid_cache_blocks_swa_tail_window_only():
     # 8 hash-blocks of 8 tokens (64 tokens, two lcm-aligned segments).
     token_ids = [i for i in range(8) for _ in range(block_size)]
     req = make_request("0", token_ids, block_size, sha256)
-    computed_blocks, _ = manager.get_computed_blocks(req)
+    computed_blocks, *_ = manager.get_computed_blocks(req)
     blocks = manager.allocate_slots(
         req,
         8 * block_size,
@@ -2715,7 +2717,7 @@ def test_hybrid_cache_blocks_clamped_to_lcm():
     # to 96 tokens — SWA caches 6 hashes, full-attn caches 3.
     token_ids = [i for i in range(7) for _ in range(block_size)]
     req = make_request("0", token_ids, block_size, sha256)
-    computed_blocks, _ = manager.get_computed_blocks(req)
+    computed_blocks, *_ = manager.get_computed_blocks(req)
     blocks = manager.allocate_slots(
         req,
         7 * block_size,
