@@ -2555,6 +2555,10 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     scheduler.perf_metrics = None
     scheduler.connector = None
     scheduler.structured_output_manager = Mock()
+    scheduler.structured_output_manager.precommit_filter_tokens.return_value = (
+        [123],
+        0,
+    )
     scheduler.structured_output_manager.should_advance.return_value = True
     scheduler.requests = {request.request_id: request}
     scheduler.running = [request]
