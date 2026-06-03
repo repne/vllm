@@ -255,7 +255,7 @@ def _resolve_gdn_prefill_backend(
         return backend, "triton"
 
     head_k_dim = getattr(
-        vllm_config.model_config.hf_config, "linear_key_head_dim", None
+        vllm_config.model_config.hf_text_config, "linear_key_head_dim", None
     )
 
     supports_flashinfer = False
@@ -296,7 +296,7 @@ def _log_gdn_backend_decision(
 ) -> None:
     """Log the GDN prefill backend choice in the attention-selector style."""
     head_k_dim = getattr(
-        vllm_config.model_config.hf_config, "linear_key_head_dim", None
+        vllm_config.model_config.hf_text_config, "linear_key_head_dim", None
     )
     chosen = {
         "flashinfer": "FlashInfer",
