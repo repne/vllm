@@ -1156,7 +1156,7 @@ class Qwen3XMLToolParser(ToolParser):
         self.prev_tool_call_arr: list[dict] = []
         self.streamed_args_for_tool: list[str] = []
 
-        logger.info(
+        logger.debug(
             "vLLM Successfully import tool parser %s !", self.__class__.__name__
         )
 
