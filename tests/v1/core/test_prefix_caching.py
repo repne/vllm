@@ -1035,7 +1035,7 @@ def test_hybrid_cache_mamba_align_shared_prefix_detection():
     scheduling aligned with the common prefix.
     """
     block_size = 16
-    manager = KVCacheManager(
+    manager = make_kv_cache_manager(
         _make_hybrid_kv_cache_config(block_size, 30, ["full", "mamba_align"]),
         max_model_len=8192,
         enable_caching=True,
@@ -2590,7 +2590,7 @@ def test_eagle_swa_alignment_caches_extra_block():
     # Prime the cache with a long prompt (16 swa blocks = 4 aligned segments).
     token_ids = [i for i in range(16) for _ in range(block_size)]
     req0 = make_request("0", token_ids, block_size, sha256)
-    computed_blocks, _ = manager.get_computed_blocks(req0)
+    computed_blocks, *_ = manager.get_computed_blocks(req0)
     blocks = manager.allocate_slots(
         req0,
         len(token_ids),
@@ -2604,7 +2604,7 @@ def test_eagle_swa_alignment_caches_extra_block():
     # Without the fix, ``num_computed_tokens`` is 0; with the fix, it lands at
     # an alignment boundary (multiple of 32 tokens, minus the EAGLE drop).
     req1 = make_request("1", token_ids, block_size, sha256)
-    _, num_computed_tokens = manager.get_computed_blocks(req1)
+    _, num_computed_tokens, *_ = manager.get_computed_blocks(req1)
     assert num_computed_tokens > 0, (
         "EAGLE + SWA with sliding_window <= alignment failed to find any "
         "cache hit; the +1 block past each segment boundary must be cached."
@@ -2659,7 +2659,7 @@ def test_eagle_swa_boundary_caches_post_boundary_block():
 
     token_ids = [i for i in range(5) for _ in range(block_size)]
     req0 = make_request("0", token_ids, block_size, sha256)
-    computed_blocks, _ = manager.get_computed_blocks(req0)
+    computed_blocks, *_ = manager.get_computed_blocks(req0)
     blocks = manager.allocate_slots(
         req0,
         len(token_ids),
@@ -2674,7 +2674,7 @@ def test_eagle_swa_boundary_caches_post_boundary_block():
     manager.free(req0)
 
     req1 = make_request("1", token_ids + [999], block_size, sha256)
-    _, num_computed_tokens = manager.get_computed_blocks(req1)
+    _, num_computed_tokens, *_ = manager.get_computed_blocks(req1)
     assert num_computed_tokens == 4 * block_size
 
 
@@ -2715,7 +2715,7 @@ def test_eagle_grouped_swa_siblings_use_same_cache_mask():
 
     token_ids = [i for i in range(9) for _ in range(block_size)]
     req0 = make_request("0", token_ids, block_size, sha256)
-    computed_blocks, _ = manager.get_computed_blocks(req0)
+    computed_blocks, *_ = manager.get_computed_blocks(req0)
     blocks = manager.allocate_slots(
         req0,
         len(token_ids),
@@ -2730,7 +2730,7 @@ def test_eagle_grouped_swa_siblings_use_same_cache_mask():
     manager.free(req0)
 
     req1 = make_request("1", token_ids + [999], block_size, sha256)
-    _, num_computed_tokens = manager.get_computed_blocks(req1)
+    _, num_computed_tokens, *_ = manager.get_computed_blocks(req1)
     assert num_computed_tokens == 8 * block_size
 
 
