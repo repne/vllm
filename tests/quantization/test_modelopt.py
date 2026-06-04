@@ -126,6 +126,30 @@ def test_modelopt_mixed_precision_quantizes_parallel_lm_head():
     assert isinstance(method, ModelOptNvFp4LinearMethod)
 
 
+def test_modelopt_mixed_precision_resolves_qwen_vlm_prefix_fallbacks():
+    config = _mixed_precision_config(
+        {
+            "lm_head": {"quant_algo": "W4A16_NVFP4"},
+            "model.language_model.layers.0.self_attn.q_proj": {
+                "quant_algo": "NVFP4"
+            },
+            "language_model.model.layers.1.self_attn.k_proj": {
+                "quant_algo": "W4A16_NVFP4"
+            },
+        }
+    )
+
+    assert config._resolve_quant_algo("language_model.lm_head") == "W4A16_NVFP4"
+    assert (
+        config._resolve_quant_algo("language_model.model.layers.0.self_attn.q_proj")
+        == "NVFP4"
+    )
+    assert (
+        config._resolve_quant_algo("model.language_model.layers.1.self_attn.k_proj")
+        == "W4A16_NVFP4"
+    )
+
+
 def test_vocab_parallel_embedding_weight_loader_accepts_scalar_scale():
     holder = Mock()
     scale = torch.nn.Parameter(torch.empty(1))

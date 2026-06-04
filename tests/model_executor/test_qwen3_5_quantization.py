@@ -7,7 +7,9 @@ from unittest.mock import Mock, patch
 def test_qwen3_5_lm_head_receives_quant_config():
     from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLMBase
 
-    mock_quant_config = Mock()
+    mock_quant_config = Mock(spec=["exclude_modules", "packed_modules_mapping"])
+    mock_quant_config.exclude_modules = []
+    mock_quant_config.packed_modules_mapping = {}
 
     mock_hf_config = Mock()
     mock_hf_config.tie_word_embeddings = False
