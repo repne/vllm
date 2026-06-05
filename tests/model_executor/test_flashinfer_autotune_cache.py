@@ -5,7 +5,7 @@ import sys
 from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import vllm.utils.flashinfer as fi_utils
 from vllm.distributed import parallel_state
@@ -178,17 +178,36 @@ def test_flashinfer_autotune_counts_cover_250k_2048_config() -> None:
     )
 
 
-def test_flashinfer_autotune_passes_expanded_buckets(monkeypatch) -> None:
+def test_flashinfer_autotune_persists_expanded_buckets(monkeypatch, tmp_path) -> None:
     autotune_kwargs = []
     dummy_runs = []
     barriers = []
+    broadcasts = []
+    loaded_configs = []
+    cache_path = tmp_path / "autotune_configs.json"
 
     @contextmanager
     def fake_autotune(**kwargs):
         autotune_kwargs.append(kwargs)
         yield
+        Path(kwargs["cache"]).write_bytes(b'{"configs": []}')
+
+    class FakeAutoTuner:
+        @classmethod
+        def get(cls):
+            return cls()
+
+        def load_configs(self, path):
+            loaded_configs.append(path)
 
     class FakeWorld:
+        rank_in_group = 0
+        local_rank = 0
+
+        def broadcast_object(self, obj, src):
+            broadcasts.append((obj, src))
+            return obj
+
         def barrier(self):
             barriers.append("barrier")
 
@@ -199,12 +218,20 @@ def test_flashinfer_autotune_passes_expanded_buckets(monkeypatch) -> None:
         _dummy_run=lambda **kwargs: dummy_runs.append(kwargs),
     )
 
+    fake_autotuner = ModuleType("flashinfer.autotuner")
+    fake_autotuner.AutoTuner = FakeAutoTuner
+    monkeypatch.setitem(sys.modules, "flashinfer.autotuner", fake_autotuner)
     monkeypatch.setattr(fi_utils, "autotune", fake_autotune)
     monkeypatch.setattr(parallel_state, "get_world_group", lambda: FakeWorld())
+    monkeypatch.setattr(
+        kernel_warmup, "_resolve_flashinfer_autotune_file", lambda _: cache_path
+    )
 
     kernel_warmup.flashinfer_autotune(runner)
 
-    assert autotune_kwargs == [{}]
+    assert autotune_kwargs == [
+        {"tune_mode": True, "cache": str(cache_path)},
+    ]
     assert dummy_runs == [
         {
             "num_tokens": 16384,
@@ -227,4 +254,6 @@ def test_flashinfer_autotune_passes_expanded_buckets(monkeypatch) -> None:
             "is_profile": True,
         },
     ]
+    assert broadcasts == [(b'{"configs": []}', 0)]
     assert barriers == ["barrier"]
+    assert loaded_configs == [str(cache_path)]
