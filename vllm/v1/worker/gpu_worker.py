@@ -393,7 +393,15 @@ class Worker(WorkerBase):
                 "correspondingly."
             )
             logger.info(msg)
-            self._maybe_flashinfer_autotune_early()
+            retained_autotune_memory = self._maybe_flashinfer_autotune_early()
+            if retained_autotune_memory > 0:
+                logger.warning(
+                    "FlashInfer early autotuning retained %s GiB after "
+                    "kv_cache_memory_bytes was set explicitly. The configured "
+                    "KV cache size is left unchanged; reduce "
+                    "kv_cache_memory_bytes if initialization OOMs.",
+                    format_gib(retained_autotune_memory),
+                )
             return kv_cache_memory_bytes
 
         # Execute a forward pass with dummy inputs to profile the memory usage
@@ -516,10 +524,16 @@ class Worker(WorkerBase):
                     suggested_util,
                 )
 
-        self._maybe_flashinfer_autotune_early()
+        retained_autotune_memory = self._maybe_flashinfer_autotune_early()
+        if retained_autotune_memory > 0:
+            self.available_kv_cache_memory_bytes -= retained_autotune_memory
+            logger.info_once(
+                "Available KV cache memory after FlashInfer autotuning: %s GiB",
+                format_gib(self.available_kv_cache_memory_bytes),
+            )
         return int(self.available_kv_cache_memory_bytes)
 
-    def _maybe_flashinfer_autotune_early(self) -> None:
+    def _maybe_flashinfer_autotune_early(self) -> int:
         """Run FlashInfer autotuning while KV cache is not yet allocated.
 
         The FlashInfer autotuner benchmarks many kernel tactics, each of which
@@ -539,21 +553,40 @@ class Worker(WorkerBase):
             self.vllm_config.kernel_config.enable_flashinfer_autotune
         )
         if enable_flashinfer_autotune is False:
-            return
+            return 0
+        if getattr(self, "_did_flashinfer_autotune_early", False):
+            return 0
         if not (has_flashinfer() and current_platform.has_device_capability(90)):
-            return
+            return 0
 
         logger.info(
             "Running FlashInfer autotuning early (before KV cache allocation) "
             "to avoid autotuner OOM."
         )
+        gc.collect()
+        torch.accelerator.empty_cache()
+        before_autotune = MemorySnapshot(device=self.device)
+
         flashinfer_autotune(self.model_runner)
+
         # Free any transient memory the autotuner allocated.
         gc.collect()
         torch.accelerator.empty_cache()
+        after_autotune = MemorySnapshot(device=self.device)
+        retained_memory = max(
+            0,
+            before_autotune.free_memory - after_autotune.free_memory,
+        )
+        if retained_memory > 0:
+            logger.info(
+                "FlashInfer early autotuning retained %s GiB of memory.",
+                format_gib(retained_memory),
+            )
+        self.flashinfer_autotune_retained_memory = retained_memory
         # Mark that early autotuning completed so kernel_warmup() skips
         # the redundant (and potentially OOM-prone) second autotuning call.
         self._did_flashinfer_autotune_early = True
+        return retained_memory
 
     def get_kv_connector_handshake_metadata(self) -> dict | None:
         """Get KV connector metadata from this worker if available."""

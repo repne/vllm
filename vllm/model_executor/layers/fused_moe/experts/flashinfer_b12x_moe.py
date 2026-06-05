@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import dataclass
+from weakref import WeakValueDictionary
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -20,11 +23,31 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4StaticGroupScale,
     kStaticTensorScale,
 )
+from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import (
     flashinfer_convert_sf_to_mma_layout,
     has_flashinfer_b12x_moe,
 )
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
+
+@dataclass(frozen=True)
+class _B12xWrapperKey:
+    num_experts: int
+    topk: int
+    hidden_dim: int
+    intermediate_size: int
+    max_num_tokens: int
+    num_local_experts: int
+    activation: str
+    activation_precision: str
+    source_format: str
+    device: str
+    ubatch_id: int
+
+
+_B12X_WRAPPERS: WeakValueDictionary[_B12xWrapperKey, object] = WeakValueDictionary()
 
 
 class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
@@ -54,7 +77,7 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         quant_config: FusedMoEQuantConfig,
     ):
         super().__init__(moe_config=moe_config, quant_config=quant_config)
-        assert quant_config.quant_dtype == "nvfp4", (
+        assert quant_config.weight_quant_dtype == "nvfp4", (
             "FlashInferB12xExperts only supports nvfp4 quantization."
         )
         self.out_dtype = moe_config.in_dtype
@@ -95,8 +118,15 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         # been wired through yet.
         self.source_format = quant_config.source_format or "modelopt"
 
-        # Lazily created on first apply() call.
-        self._wrapper: object | None = None
+        # Lazily created on first apply() call. The wrapper owns large
+        # shape-scoped scratch/output buffers, so it is shared across layers
+        # with matching geometry.
+        self._wrappers: dict[_B12xWrapperKey, object] = {}
+        # W4A16 B12x uses a FlashInfer-specific packed layout. Once populated,
+        # apply() uses this representation and the original checkpoint-layout
+        # parameters can be released.
+        self._w4a16_prepared_weights: object | None = None
+        self._w4a16_empty_float32: torch.Tensor | None = None
         # Populated in process_weights_after_loading.
         self.w1_sf_mma: torch.Tensor | None = None
         self.w2_sf_mma: torch.Tensor | None = None
@@ -145,28 +175,100 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
                 dtype=torch.float32,
             )
 
+        assert self.w1_scale is not None and self.w2_scale is not None
+        assert self.g1_alphas is not None and self.g2_alphas is not None
+        if self.activation_precision == "bf16":
+            if hasattr(layer, "w13_weight") and hasattr(layer, "w2_weight"):
+                self._prepare_w4a16_weights(
+                    layer.w13_weight,
+                    layer.w2_weight,
+                )
+                if isinstance(layer, torch.nn.Module):
+                    self._release_w4a16_original_layout(layer)
+        else:
+            self._prepare_nvfp4_scale_views()
+
+    def _prepare_nvfp4_scale_views(self) -> None:
         # Precompute MMA-layout views of the (now-rewritten) weight scale
         # factors once here rather than recomputing on every forward pass.
         # Converts swizzled 3D scale factors [E, M, K_sf] to the 6D MMA
         # layout expected by the SM12x kernel's _get_weight_views().
         assert self.w1_scale is not None and self.w2_scale is not None
         sf_vec_size = 16
-        E_w1, M_w1, K_sf_w1 = self.w1_scale.shape
+        e_w1, m_w1, k_sf_w1 = self.w1_scale.shape
         self.w1_sf_mma = flashinfer_convert_sf_to_mma_layout(
-            self.w1_scale.reshape(E_w1 * M_w1, K_sf_w1),
-            m=M_w1,
-            k=K_sf_w1 * sf_vec_size,
-            num_groups=E_w1,
+            self.w1_scale.reshape(e_w1 * m_w1, k_sf_w1),
+            m=m_w1,
+            k=k_sf_w1 * sf_vec_size,
+            num_groups=e_w1,
             sf_vec_size=sf_vec_size,
         )
-        E_w2, M_w2, K_sf_w2 = self.w2_scale.shape
+        e_w2, m_w2, k_sf_w2 = self.w2_scale.shape
         self.w2_sf_mma = flashinfer_convert_sf_to_mma_layout(
-            self.w2_scale.reshape(E_w2 * M_w2, K_sf_w2),
-            m=M_w2,
-            k=K_sf_w2 * sf_vec_size,
-            num_groups=E_w2,
+            self.w2_scale.reshape(e_w2 * m_w2, k_sf_w2),
+            m=m_w2,
+            k=k_sf_w2 * sf_vec_size,
+            num_groups=e_w2,
             sf_vec_size=sf_vec_size,
         )
+
+    def _prepare_w4a16_weights(
+        self,
+        w13_weight: torch.Tensor,
+        w2_weight: torch.Tensor,
+    ) -> None:
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_prepare import (
+            prepare_w4a16_packed_weights,
+        )
+
+        if self._w4a16_prepared_weights is not None:
+            return
+
+        assert self.w1_scale is not None and self.w2_scale is not None
+        assert self.g1_alphas is not None and self.g2_alphas is not None
+        self._w4a16_prepared_weights = prepare_w4a16_packed_weights(
+            w13_weight,
+            self.w1_scale,
+            self.g1_alphas,
+            w2_weight,
+            self.w2_scale,
+            self.g2_alphas,
+            activation=self._activation_str,
+            params_dtype=self.out_dtype,
+            source_format=self.source_format,
+        )
+        self._w4a16_empty_float32 = torch.empty(
+            0,
+            dtype=torch.float32,
+            device=w13_weight.device,
+        )
+
+    def _release_w4a16_original_layout(self, layer: torch.nn.Module) -> None:
+        # The prepared layout owns the runtime weight tensors. Drop the original
+        # checkpoint-layout payloads so FlashInfer B12x W4A16 does not keep a
+        # second copy of every MoE layer's weights and block scales.
+        w13_rows = (2 if self._activation_str == "silu" else 1) * (
+            self.intermediate_size_per_partition
+        )
+        replacements = {
+            "w13_weight": (0, w13_rows, self.hidden_dim // 2),
+            "w2_weight": (
+                0,
+                self.hidden_dim,
+                self.intermediate_size_per_partition // 2,
+            ),
+            "w13_weight_scale": (0,),
+            "w2_weight_scale": (0,),
+        }
+        for name, shape in replacements.items():
+            old_param = getattr(layer, name)
+            replace_parameter(
+                layer,
+                name,
+                torch.empty(shape, dtype=old_param.dtype, device=old_param.device),
+            )
+        self.quant_config._w1.scale = None
+        self.quant_config._w2.scale = None
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -243,14 +345,10 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         # from pre-quantizing activations.
         return True
 
-    def _ensure_wrapper(self) -> None:
-        """Lazily create B12xMoEWrapper on first use."""
-        if self._wrapper is not None:
-            return
-
+    def _make_wrapper(self, device: torch.device | str) -> object:
         from flashinfer.fused_moe import B12xMoEWrapper
 
-        self._wrapper = B12xMoEWrapper(
+        return B12xMoEWrapper(
             num_experts=self.global_num_experts,
             top_k=self.topk,
             hidden_size=self.hidden_dim,
@@ -261,6 +359,75 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             activation=self._activation_str,
             activation_precision=self.activation_precision,
             source_format=self.source_format,
+            device=str(device),
+        )
+
+    def _wrapper_key(self, device: torch.device | str) -> _B12xWrapperKey:
+        return _B12xWrapperKey(
+            num_experts=self.global_num_experts,
+            topk=self.topk,
+            hidden_dim=self.hidden_dim,
+            intermediate_size=self.intermediate_size_per_partition,
+            max_num_tokens=self.max_num_tokens,
+            num_local_experts=self.num_local_experts,
+            activation=self._activation_str,
+            activation_precision=self.activation_precision,
+            source_format=self.source_format,
+            device=str(device),
+            ubatch_id=dbo_current_ubatch_id(),
+        )
+
+    def _ensure_wrapper(self, device: torch.device | str) -> object:
+        """Lazily create B12xMoEWrapper on first use."""
+        key = self._wrapper_key(device)
+        wrapper = self._wrappers.get(key)
+        if wrapper is not None:
+            return wrapper
+
+        wrapper = _B12X_WRAPPERS.get(key)
+        if wrapper is None:
+            wrapper = self._make_wrapper(device)
+            _B12X_WRAPPERS[key] = wrapper
+        self._wrappers[key] = wrapper
+        return wrapper
+
+    def _run_w4a16_prepared(
+        self,
+        wrapper: object,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
+            launch_sm120_moe,
+        )
+
+        assert self._w4a16_prepared_weights is not None
+        assert self._w4a16_empty_float32 is not None
+        num_tokens = topk_ids.size(0)
+        moe_output = wrapper._moe_output[:num_tokens]  # type: ignore[attr-defined]
+        return launch_sm120_moe(
+            a=hidden_states,
+            topk_ids=topk_ids.to(torch.int32),
+            topk_weights=topk_weights,
+            w1_weight=w1,
+            w1_weight_sf=w1,
+            w1_alpha=self._w4a16_empty_float32,
+            fc2_input_scale=None,
+            w2_weight=w2,
+            w2_weight_sf=w2,
+            w2_alpha=self._w4a16_empty_float32,
+            num_experts=self.global_num_experts,
+            top_k=self.topk,
+            num_local_experts=self.num_local_experts,
+            scatter_output=moe_output,
+            activation=self._activation_str,
+            quant_mode="w4a16",
+            source_format=self.source_format,
+            _workspace=wrapper._static_workspace,  # type: ignore[attr-defined]
+            _prepared_weights=self._w4a16_prepared_weights,
         )
 
     def apply(
@@ -281,9 +448,20 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
     ):
-        assert self.w1_scale is not None and self.w2_scale is not None, (
-            "w1_scale and w2_scale must not be None for FlashInferB12xExperts"
-        )
+        wrapper = self._ensure_wrapper(hidden_states.device)
+        if self.activation_precision == "bf16":
+            self._prepare_w4a16_weights(w1, w2)
+            result = self._run_w4a16_prepared(
+                wrapper,
+                hidden_states,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+            )
+            output.copy_(result)
+            return
+
         assert self.g1_alphas is not None and self.g2_alphas is not None, (
             "g1_alphas and g2_alphas must not be None for FlashInferB12xExperts"
         )
@@ -294,9 +472,7 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             "process_weights_after_loading must run before FlashInferB12xExperts.apply"
         )
 
-        self._ensure_wrapper()
-
-        result = self._wrapper.run(
+        result = wrapper.run(
             x=hidden_states,
             w1_weight=w1,
             w1_weight_sf=self.w1_sf_mma,

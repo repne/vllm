@@ -476,7 +476,7 @@ def make_nvfp4_moe_quant_config(
     swiglu_limit: float | None = None,
     source_format: str | None = None,
 ) -> FusedMoEQuantConfig:
-    if backend == NvFp4MoeBackend.MARLIN:
+    if backend in (NvFp4MoeBackend.MARLIN, NvFp4MoeBackend.FLASHINFER_B12X):
         return nvfp4_w4a16_moe_quant_config(
             g1_alphas=w13_scale_2,
             g2_alphas=w2_scale_2,
