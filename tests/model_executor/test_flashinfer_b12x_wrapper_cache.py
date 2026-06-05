@@ -63,8 +63,13 @@ def _install_fake_w4a16_prepare(monkeypatch):
     return prepared, calls
 
 
-def _make_experts(*, w4a16: bool) -> FlashInferB12xExperts:
-    num_experts = 2
+def _make_experts(
+    *,
+    w4a16: bool,
+    num_experts: int = 2,
+    experts_per_token: int = 2,
+    max_num_tokens: int = 64,
+) -> FlashInferB12xExperts:
     ones = torch.ones(num_experts, dtype=torch.float32)
     if w4a16:
         quant_config = nvfp4_w4a16_moe_quant_config(
@@ -86,7 +91,7 @@ def _make_experts(*, w4a16: bool) -> FlashInferB12xExperts:
         )
     moe_config = FusedMoEConfig(
         num_experts=num_experts,
-        experts_per_token=2,
+        experts_per_token=experts_per_token,
         hidden_dim=128,
         intermediate_size_per_partition=256,
         num_local_experts=num_experts,
@@ -96,7 +101,7 @@ def _make_experts(*, w4a16: bool) -> FlashInferB12xExperts:
         in_dtype=torch.bfloat16,
         device="cuda",
         routing_method=RoutingMethodType.TopK,
-        max_num_tokens=64,
+        max_num_tokens=max_num_tokens,
     )
     return FlashInferB12xExperts(moe_config=moe_config, quant_config=quant_config)
 
@@ -269,3 +274,80 @@ def test_w4a16_process_weights_prepares_and_releases_original_layout(
     assert experts.quant_config.w2_scale is None
     assert experts._w4a16_empty_float32 is not None
     assert experts._w4a16_empty_float32.numel() == 0
+
+
+def test_w4a16_route_pack_chunk_size_keeps_qwen_shape_under_triton_limit() -> None:
+    experts = _make_experts(
+        w4a16=True,
+        num_experts=256,
+        experts_per_token=8,
+        max_num_tokens=32768,
+    )
+
+    assert experts._w4a16_route_pack_tensor_numel(16384) == 1 << 20
+    assert experts._w4a16_route_pack_tensor_numel(32768) == 1 << 21
+
+    chunk_size = experts._max_w4a16_chunk_tokens()
+
+    assert chunk_size < 16384
+    assert experts._w4a16_route_pack_tensor_numel(chunk_size) <= 1 << 19
+    assert experts._w4a16_route_pack_tensor_numel(chunk_size + 1) > 1 << 19
+
+
+def test_w4a16_apply_chunks_large_batches(monkeypatch) -> None:
+    experts = _make_experts(w4a16=True)
+    wrapper = object()
+    calls: list[int] = []
+
+    experts._w4a16_prepared_weights = object()
+    monkeypatch.setattr(experts, "_ensure_wrapper", lambda device: wrapper)
+    monkeypatch.setattr(experts, "_max_w4a16_chunk_tokens", lambda: 3)
+
+    def fake_run_w4a16_prepared(
+        wrapper_arg,
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+    ):
+        assert wrapper_arg is wrapper
+        assert topk_weights.size(0) == hidden_states.size(0)
+        assert topk_ids.size(0) == hidden_states.size(0)
+        calls.append(hidden_states.size(0))
+        return torch.full_like(hidden_states, len(calls))
+
+    monkeypatch.setattr(
+        experts,
+        "_run_w4a16_prepared",
+        fake_run_w4a16_prepared,
+    )
+
+    hidden_states = torch.zeros(5, experts.hidden_dim, dtype=torch.bfloat16)
+    output = torch.empty_like(hidden_states)
+    topk_weights = torch.ones(5, experts.topk, dtype=torch.float32)
+    topk_ids = torch.zeros(5, experts.topk, dtype=torch.int32)
+    w1 = torch.empty(0)
+    w2 = torch.empty(0)
+
+    experts.apply(
+        output=output,
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        activation=MoEActivation.SILU,
+        global_num_experts=experts.global_num_experts,
+        expert_map=None,
+        a1q_scale=None,
+        a2_scale=None,
+        workspace13=None,
+        workspace2=None,
+        expert_tokens_meta=None,
+        apply_router_weight_on_input=None,
+    )
+
+    assert calls == [3, 2]
+    assert torch.all(output[:3] == 1)
+    assert torch.all(output[3:] == 2)

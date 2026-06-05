@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from dataclasses import dataclass
 from weakref import WeakValueDictionary
 
@@ -48,6 +49,9 @@ class _B12xWrapperKey:
 
 
 _B12X_WRAPPERS: WeakValueDictionary[_B12xWrapperKey, object] = WeakValueDictionary()
+_TRITON_MAX_TENSOR_NUMEL = 1 << 20
+_W4A16_ALLOWED_ROUTED_SIZES = (8, 16, 32, 48, 64)
+_W4A16_ROUTE_PACK_TARGET_FILL = 0.9
 
 
 class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
@@ -217,12 +221,12 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         w13_weight: torch.Tensor,
         w2_weight: torch.Tensor,
     ) -> None:
+        if self._w4a16_prepared_weights is not None:
+            return
+
         from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_prepare import (
             prepare_w4a16_packed_weights,
         )
-
-        if self._w4a16_prepared_weights is not None:
-            return
 
         assert self.w1_scale is not None and self.w2_scale is not None
         assert self.g1_alphas is not None and self.g2_alphas is not None
@@ -430,6 +434,81 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             _prepared_weights=self._w4a16_prepared_weights,
         )
 
+    @staticmethod
+    def _next_power_of_2(x: int) -> int:
+        return 1 << (max(int(x), 1) - 1).bit_length()
+
+    @staticmethod
+    def _select_w4a16_route_block_size_m(
+        num_tokens: int,
+        topk: int,
+        num_experts: int,
+    ) -> int:
+        avg_routes_per_expert = (int(num_tokens) * int(topk)) / int(num_experts)
+        for routed_size in _W4A16_ALLOWED_ROUTED_SIZES:
+            if avg_routes_per_expert < _W4A16_ROUTE_PACK_TARGET_FILL * routed_size:
+                return routed_size
+        return _W4A16_ALLOWED_ROUTED_SIZES[-1]
+
+    @staticmethod
+    def _max_w4a16_packed_route_slots(
+        numel: int,
+        block_size: int,
+        num_experts: int,
+    ) -> int:
+        max_packed_routes = int(numel) + int(num_experts) * (int(block_size) - 1)
+        if int(numel) < int(num_experts):
+            max_packed_routes = min(
+                int(numel) * int(block_size),
+                max_packed_routes,
+            )
+        return max(max_packed_routes, 1)
+
+    def _w4a16_route_pack_tensor_numel(self, num_tokens: int) -> int:
+        # FlashInfer's W4A16 route-packing prefix kernel materializes
+        # BLOCK_ROUTE_INIT and [BLOCK_E, BLOCK_M] Triton tensors. Triton
+        # rejects tensors above 1,048,576 elements, so keep large prefill
+        # batches below those shapes.
+        route_num_experts = (
+            self.global_num_experts
+            if self.num_local_experts != self.global_num_experts
+            else self.num_local_experts
+        )
+        block_size = self._select_w4a16_route_block_size_m(
+            num_tokens,
+            self.topk,
+            route_num_experts,
+        )
+        max_packed_routes = self._max_w4a16_packed_route_slots(
+            int(num_tokens) * self.topk,
+            block_size,
+            route_num_experts,
+        )
+        max_route_blocks = (max_packed_routes + block_size - 1) // block_size
+        block_route_init = self._next_power_of_2(max_packed_routes)
+        block_e = self._next_power_of_2(route_num_experts)
+        block_m = self._next_power_of_2(max_route_blocks)
+        return max(block_route_init, block_e * block_m)
+
+    def _max_w4a16_chunk_tokens(self) -> int:
+        override = os.environ.get("VLLM_FLASHINFER_B12X_W4A16_CHUNK_SIZE")
+        if override:
+            return max(1, int(override))
+
+        limit = _TRITON_MAX_TENSOR_NUMEL // 2
+        if self._w4a16_route_pack_tensor_numel(self.max_num_tokens) <= limit:
+            return self.max_num_tokens
+
+        low = 1
+        high = self.max_num_tokens
+        while low < high:
+            mid = (low + high + 1) // 2
+            if self._w4a16_route_pack_tensor_numel(mid) <= limit:
+                low = mid
+            else:
+                high = mid - 1
+        return low
+
     def apply(
         self,
         output: torch.Tensor,
@@ -451,15 +530,18 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         wrapper = self._ensure_wrapper(hidden_states.device)
         if self.activation_precision == "bf16":
             self._prepare_w4a16_weights(w1, w2)
-            result = self._run_w4a16_prepared(
-                wrapper,
-                hidden_states,
-                w1,
-                w2,
-                topk_weights,
-                topk_ids,
-            )
-            output.copy_(result)
+            chunk_size = self._max_w4a16_chunk_tokens()
+            for start in range(0, hidden_states.size(0), chunk_size):
+                end = min(start + chunk_size, hidden_states.size(0))
+                result = self._run_w4a16_prepared(
+                    wrapper,
+                    hidden_states[start:end],
+                    w1,
+                    w2,
+                    topk_weights[start:end],
+                    topk_ids[start:end],
+                )
+                output[start:end].copy_(result)
             return
 
         assert self.g1_alphas is not None and self.g2_alphas is not None, (
