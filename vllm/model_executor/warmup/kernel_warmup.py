@@ -123,6 +123,166 @@ def kernel_warmup(worker: "Worker"):
 # invalid tactics to be chosen
 _FLASHINFER_USE_PERSISTENT_CACHE = False
 
+def _spec_decode_uses_eagle(runner: "GPUModelRunner") -> bool:
+    spec_config = getattr(runner, "speculative_config", None)
+    if spec_config is None:
+        return False
+    use_eagle = getattr(spec_config, "use_eagle", None)
+    if not callable(use_eagle):
+        return False
+    return bool(use_eagle())
+
+
+def _spec_decode_query_len(runner: "GPUModelRunner") -> int:
+    query_len = int(getattr(runner, "uniform_decode_query_len", 0) or 0)
+    if query_len > 0:
+        return query_len
+
+    spec_config = getattr(runner, "speculative_config", None)
+    if spec_config is None:
+        return 1
+
+    num_spec_tokens = int(getattr(spec_config, "num_speculative_tokens", 0) or 0)
+    return 1 + num_spec_tokens
+
+
+def _runner_max_num_seqs(runner: "GPUModelRunner") -> int:
+    scheduler_config = runner.scheduler_config
+    return int(getattr(scheduler_config, "max_num_seqs", 1) or 1)
+
+
+def _runner_max_model_len(runner: "GPUModelRunner") -> int:
+    max_model_len = int(getattr(runner, "max_model_len", 0) or 0)
+    if max_model_len > 0:
+        return max_model_len
+
+    model_config = getattr(runner, "model_config", None)
+    max_model_len = int(getattr(model_config, "max_model_len", 0) or 0)
+    if max_model_len > 0:
+        return max_model_len
+
+    vllm_config = getattr(runner, "vllm_config", None)
+    model_config = getattr(vllm_config, "model_config", None)
+    return int(getattr(model_config, "max_model_len", 0) or 0)
+
+
+def _runner_cudagraph_capture_sizes(runner: "GPUModelRunner") -> tuple[int, ...]:
+    compilation_config = getattr(runner, "compilation_config", None)
+    if compilation_config is None:
+        vllm_config = getattr(runner, "vllm_config", None)
+        compilation_config = getattr(vllm_config, "compilation_config", None)
+    if compilation_config is None:
+        return ()
+
+    capture_sizes = getattr(compilation_config, "cudagraph_capture_sizes", None)
+    if not capture_sizes:
+        return ()
+    return tuple(sorted(set(int(size) for size in capture_sizes if int(size) > 0)))
+
+
+def _add_packed_residual_counts(
+    token_counts: list[int],
+    *,
+    residual_tokens: int,
+    max_num_tokens: int,
+    max_num_seqs: int,
+) -> None:
+    if residual_tokens <= 0:
+        return
+
+    max_pack = min(max_num_seqs, max_num_tokens // residual_tokens)
+    if max_pack <= 0:
+        return
+
+    # Cover a single tail, the observed four-way concurrency tail, and the
+    # largest tail pack the scheduler can place in one batch. Warming every
+    # possible tail size is too expensive because each exact count replays the
+    # whole model under FlashInfer autotune.
+    token_counts.append(residual_tokens)
+    token_counts.append(min(4, max_pack) * residual_tokens)
+    token_counts.append(max_pack * residual_tokens)
+
+
+def _add_flashinfer_cudagraph_counts(
+    token_counts: list[int],
+    runner: "GPUModelRunner",
+    max_num_tokens: int,
+) -> None:
+    capture_sizes = _runner_cudagraph_capture_sizes(runner)
+    if not capture_sizes:
+        return
+
+    max_capture_size = min(capture_sizes[-1], max_num_tokens)
+    if max_capture_size <= 0:
+        return
+
+    spec_decode_offset = 0
+    query_len = _spec_decode_query_len(runner)
+    if query_len > 1:
+        # EAGLE/MTP graph warmups can run the model FP8 GEMMs at a smaller
+        # effective M than the captured graph size. For num_speculative_tokens=3,
+        # a 64-token graph has shown FP8 GEMM shapes at M=56.
+        spec_decode_offset = 2 * query_len
+
+    important_sizes = [max_capture_size]
+    if spec_decode_offset > 0 and max_capture_size > spec_decode_offset:
+        important_sizes.append(max_capture_size - spec_decode_offset)
+
+    if max_capture_size > 64 and 64 in capture_sizes:
+        important_sizes.append(64)
+        if spec_decode_offset > 0 and spec_decode_offset < 64:
+            important_sizes.append(64 - spec_decode_offset)
+
+    token_counts.extend(important_sizes)
+
+
+def _flashinfer_autotune_token_counts(runner: "GPUModelRunner") -> tuple[int, ...]:
+    """Exact token counts to execute during FlashInfer autotune.
+
+    Some FlashInfer runners include raw input shapes in their cache-key extras.
+    For those runners, executing only a 16,384-token dummy batch may not cover
+    the exact 15,008-token shape produced by vLLM's Mamba-aligned chunked
+    prefill. Run the scheduler-aligned prefill, packed tail, and graph capture
+    shapes during autotune while keeping FlashInfer's default bucket mapping
+    active, so runtime cache lookups use the same tuning-config identity.
+    """
+    max_num_tokens = int(runner.scheduler_config.max_num_batched_tokens)
+    token_counts = [max_num_tokens]
+    max_num_seqs = _runner_max_num_seqs(runner)
+    max_model_len = _runner_max_model_len(runner)
+
+    cache_config = getattr(runner, "cache_config", None)
+    if cache_config is None:
+        cache_config = runner.vllm_config.cache_config
+    block_size = int(getattr(cache_config, "block_size", 0) or 0)
+    chunk_tokens = max_num_tokens
+    if block_size > 0:
+        aligned_tokens = max_num_tokens // block_size * block_size
+        if aligned_tokens > 0:
+            token_counts.append(aligned_tokens)
+            chunk_tokens = aligned_tokens
+        if _spec_decode_uses_eagle(runner) and aligned_tokens > block_size:
+            chunk_tokens = aligned_tokens - block_size
+            token_counts.append(chunk_tokens)
+
+    _add_packed_residual_counts(
+        token_counts,
+        residual_tokens=max_num_tokens - chunk_tokens,
+        max_num_tokens=max_num_tokens,
+        max_num_seqs=max_num_seqs,
+    )
+    if max_model_len > 0:
+        _add_packed_residual_counts(
+            token_counts,
+            residual_tokens=max_model_len % chunk_tokens,
+            max_num_tokens=max_num_tokens,
+            max_num_seqs=max_num_seqs,
+        )
+
+    _add_flashinfer_cudagraph_counts(token_counts, runner, max_num_tokens)
+
+    return tuple(dict.fromkeys(t for t in token_counts if 0 < t <= max_num_tokens))
+
 
 def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     """
@@ -140,13 +300,16 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     import vllm.utils.flashinfer as fi_utils
     from vllm.distributed.parallel_state import get_world_group
 
+    warmup_token_counts = _flashinfer_autotune_token_counts(runner)
+
     if not _FLASHINFER_USE_PERSISTENT_CACHE:
         with torch.inference_mode(), fi_utils.autotune():
-            runner._dummy_run(
-                num_tokens=runner.scheduler_config.max_num_batched_tokens,
-                skip_eplb=True,
-                is_profile=True,
-            )
+            for num_tokens in warmup_token_counts:
+                runner._dummy_run(
+                    num_tokens=num_tokens,
+                    skip_eplb=True,
+                    is_profile=True,
+                )
         get_world_group().barrier()
         return
 
@@ -158,11 +321,10 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         logger.info("Using FlashInfer autotune cache file: %s", cache_path)
 
     # We skip EPLB here since we don't want to record dummy metrics.
-    # When autotuning with number of tokens m, flashinfer will autotune
-    # operations for all number of tokens up to m, so we only need to
-    # run with the max number of tokens.
+    # When autotuning with number of tokens m, FlashInfer autotunes operations
+    # for its generated buckets up to m. Some runners also include raw tensor
+    # shapes in cache-key extras, so run the exact scheduler-aligned shapes too.
     dummy_run_kwargs = dict(
-        num_tokens=runner.scheduler_config.max_num_batched_tokens,
         skip_eplb=True,
         is_profile=True,
     )
@@ -170,9 +332,11 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     with torch.inference_mode():
         if is_leader:
             with fi_utils.autotune(tune_mode=True, cache=str(cache_path)):
-                runner._dummy_run(**dummy_run_kwargs)
+                for num_tokens in warmup_token_counts:
+                    runner._dummy_run(**dummy_run_kwargs, num_tokens=num_tokens)
         else:
-            runner._dummy_run(**dummy_run_kwargs)
+            for num_tokens in warmup_token_counts:
+                runner._dummy_run(**dummy_run_kwargs, num_tokens=num_tokens)
 
     # Broadcast autotune cache from rank 0 to all other ranks so every
     # rank loads the same set of chosen tactics.
